@@ -1,4 +1,4 @@
-# pe_summary_improved_v6.py
+# pe_summary.py
 # Malware PE triage summary using pefile.
 # Intended for first-stage static triage, not full malware analysis.
 # Dependency: pip install pefile
