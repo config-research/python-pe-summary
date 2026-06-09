@@ -3,11 +3,11 @@
 # Intended for first-stage static triage, not full malware analysis.
 # Dependency: pip install pefile
 # Usage:
-#   python pe_summary_improved_v8.py sample.exe
-#   python pe_summary_improved_v8.py sample.exe -o report.txt
-#   python pe_summary_improved_v8.py sample.exe --json
-#   python pe_summary_improved_v8.py sample.exe --json --json-output details.json
-#   python pe_summary_improved_v8.py sample.exe --print
+#   python pe_summary.py sample.exe
+#   python pe_summary.py sample.exe -o report.txt
+#   python pe_summary.py sample.exe --json
+#   python pe_summary.py sample.exe --json --json-output details.json
+#   python pe_summary.py sample.exe --print
 
 import argparse
 import base64
