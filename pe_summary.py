@@ -3,11 +3,11 @@
 # Intended for first-stage static triage, not full malware analysis.
 # Dependency: pip install pefile
 # Usage:
-#   python pe_summary_improved_v6.py sample.exe
-#   python pe_summary_improved_v6.py sample.exe -o report.txt
-#   python pe_summary_improved_v6.py sample.exe --json
-#   python pe_summary_improved_v6.py sample.exe --json --json-output details.json
-#   python pe_summary_improved_v6.py sample.exe --print
+#   python pe_summary_improved_v8.py sample.exe
+#   python pe_summary_improved_v8.py sample.exe -o report.txt
+#   python pe_summary_improved_v8.py sample.exe --json
+#   python pe_summary_improved_v8.py sample.exe --json --json-output details.json
+#   python pe_summary_improved_v8.py sample.exe --print
 
 import argparse
 import base64
@@ -73,9 +73,26 @@ NOISY_NETWORK_EXACT = {
     "crt.sectigo.com"
 }
 
+LOW_SIGNAL_URL_HOST_SUFFIXES = (
+    "wikipedia.org",
+    "code.google.com",
+    "chromium.org",
+    "nodejs.org",
+    "v8.dev",
+    "marijnhaverbeke.nl",
+    "schmorp.de",
+    "ietf.org",
+    "w3.org"
+)
+
+LOW_SIGNAL_URL_PATH_KEYWORDS = (
+    "wiki", "sourcemap", "source-map", "documentation", "docs", "readme"
+)
+
 MAGIC_SIGNATURES = [
     (b"MZ", "PE/MZ"),
     (b"\x7fELF", "ELF"),
+    (b"\x00asm", "WASM"),
     (b"PK\x03\x04", "ZIP"),
     (b"7z\xbc\xaf\x27\x1c", "7z"),
     (b"Rar!\x1a\x07", "RAR"),
@@ -135,6 +152,25 @@ KEYWORD_CATEGORIES = {
     "network_terms": [
         "user-agent", "content-type", "authorization", "bearer ",
         "websocket", "http_post", "http_get", "multipart/form-data"
+    ]
+}
+
+
+RUNTIME_MARKERS = {
+    "node_v8": [
+        "node_sea_blob", "node.pdb", "node.exe", "node_modules", "lib/internal/",
+        "process.versions.node", "napi_", "node_api", "v8::", "v8_", "v8_inspector",
+        "__wbindgen", "wasm_", "__heap_base", "parsecjs"
+    ],
+    "electron_chromium": [
+        "electron.asar", "app.asar", "electron_run_as_node", "chrome_100_percent.pak",
+        "chromium", "blink", "v8_context", "devtools://", "icudtl.dat"
+    ],
+    "pyinstaller": [
+        "_meipass", "pyiboot", "pyi_rth", "pyz-00.pyz", "pyinstaller"
+    ],
+    "go_runtime": [
+        "go build id", "runtime.main", "runtime.gopanic", "runtime.makeslice", "gogo", "go.itab."
     ]
 }
 
@@ -238,7 +274,7 @@ API_CATEGORIES = {
         "BCryptEncrypt", "BCryptGenRandom"
     },
     "credential_access": {
-        "CryptUnprotectData", "MiniDumpWriteDump", "CredEnumerateA", "CredEnumerateW", "CredReadA", "CredReadW",
+        "CryptUnprotectData", "CredEnumerateA", "CredEnumerateW", "CredReadA", "CredReadW",
         "VaultOpenVault", "VaultEnumerateVaults", "VaultEnumerateItems", "VaultGetItem"
     },
     "privilege_token": {
@@ -722,6 +758,118 @@ def confidence_rank(value):
         "medium": 1,
         "low": 2
     }.get(value, 3)
+
+
+
+def finding_sort_key(item):
+    id_priority = {
+        "entry_point_outside_sections": 0,
+        "entry_point_high_entropy": 1,
+        "section_execute_write": 2,
+        "resource_node_sea_blob": 3,
+        "overlay_non_certificate": 4,
+        "encoded_blob_interesting": 5,
+        "strings_network_indicators": 6,
+        "api_process_dumping": 7,
+        "api_downloader_execute": 8,
+        "api_downloader_file_write": 9,
+        "tls_present": 10,
+        "resources_interesting": 11,
+        "debug_pdb_path": 12,
+        "runtime_heavy_bundle_detected": 13,
+        "strings_large_noisy_corpus": 14,
+    }
+
+    return (
+        severity_rank(item.get("severity")),
+        confidence_rank(item.get("confidence")),
+        id_priority.get(item.get("id"), 50),
+        item.get("id", "")
+    )
+
+
+def confidence_value_rank(value):
+    return {
+        "high": 0,
+        "medium": 1,
+        "low": 2,
+        "noise": 3,
+        None: 4
+    }.get(value, 4)
+
+
+def string_item_sort_key(item):
+    confidence = item.get("confidence")
+    rank = confidence_value_rank(confidence)
+
+    url_type_rank = 0
+    if item.get("url_type") == "valid_url":
+        url_type_rank = -1
+    elif item.get("url_type") == "malformed_or_template_url":
+        url_type_rank = 1
+
+    ip_type_rank = 0
+    if item.get("ip_type") == "public" and confidence in {"high", "medium"}:
+        ip_type_rank = -1
+    elif item.get("ip_type") in {"private", "loopback", "reserved", "multicast", "unspecified"}:
+        ip_type_rank = 1
+
+    origin_rank = 0
+    origin = str(item.get("origin", ""))
+    if origin.startswith("certificate_table"):
+        origin_rank = 2
+    elif origin.startswith("resource:"):
+        origin_rank = 1
+
+    return (
+        rank,
+        url_type_rank,
+        ip_type_rank,
+        origin_rank,
+        item.get("offset_int", 0),
+        str(item.get("value", "")).lower()
+    )
+
+
+def string_group_label(item):
+    confidence = item.get("confidence")
+
+    if confidence == "high":
+        if item.get("url_type") == "valid_url":
+            return "High confidence / valid"
+        if item.get("context"):
+            return "High confidence / contextual"
+        return "High confidence"
+
+    if confidence == "medium":
+        return "Medium confidence / contextual"
+
+    if confidence == "low":
+        if item.get("url_type") == "malformed_or_template_url":
+            return "Low confidence / malformed or template-like"
+        return "Low confidence / weak"
+
+    if confidence == "noise":
+        return "Noise / allowlisted or certificate-related"
+
+    return "Unscored"
+
+
+def encoded_blob_sort_key(blob):
+    assessment = blob.get("assessment", {})
+    interesting_rank = 0 if assessment.get("interesting") else 1
+    triage_rank = 0 if assessment.get("triage_interesting") else 1
+    suspicious_rank = 0 if assessment.get("suspicious") else 1
+    confidence = assessment.get("confidence")
+
+    return (
+        interesting_rank,
+        triage_rank,
+        suspicious_rank,
+        confidence_rank(confidence),
+        -(blob.get("decoded_size") or 0),
+        blob.get("source_offset", "")
+    )
 
 
 def pe_hashes(path, pe):
@@ -1794,6 +1942,89 @@ def hostname_from_url(value):
     return hostname.lower().strip(".")
 
 
+def valid_hostname_or_ip(hostname):
+    if not hostname:
+        return False
+
+    host = hostname.lower().strip(".")
+
+    if host == "localhost":
+        return True
+
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+
+    if "%" in host or "_" in host:
+        return False
+
+    if host.startswith(".") or host.endswith("."):
+        return False
+
+    labels = host.split(".")
+
+    if len(labels) < 2:
+        return False
+
+    if len(labels[-1]) < 2 or not labels[-1].isalpha():
+        return False
+
+    for label in labels:
+        if not label or label.startswith("-") or label.endswith("-"):
+            return False
+
+        if not re.fullmatch(r"[a-z0-9-]+", label):
+            return False
+
+    return True
+
+
+def classify_url_candidate(value):
+    cleaned = value.strip().rstrip(".,;:)]}'\"")
+
+    try:
+        parsed = urlparse(cleaned)
+    except Exception:
+        return {
+            "value": value,
+            "valid": False,
+            "reason": "parse_error"
+        }
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return {
+            "value": cleaned,
+            "valid": False,
+            "reason": "unsupported_scheme"
+        }
+
+    host = parsed.hostname
+
+    if not host:
+        return {
+            "value": cleaned,
+            "valid": False,
+            "reason": "missing_host"
+        }
+
+    if not valid_hostname_or_ip(host):
+        return {
+            "value": cleaned,
+            "valid": False,
+            "reason": "invalid_or_template_host",
+            "host": host
+        }
+
+    return {
+        "value": cleaned,
+        "valid": True,
+        "reason": "valid_host",
+        "host": host.lower().strip(".")
+    }
+
+
 def noisy_network_reason(value, origin=None):
     candidate = value.strip(".,;:)[]{}").lower()
 
@@ -1852,15 +2083,21 @@ def classify_ipv4(ip):
 def network_context_score(value, source_string):
     lowered = source_string.lower()
     terms = [
-        "http", "https", "url", "host", "user-agent", "connect", "socket", "dns",
-        "server", "gate", "api", "post", "get", "authorization", "bearer"
+        "http", "https", "url", "host", "hostname", "user-agent", "connect", "socket", "dns",
+        "server", "gateway", "gate", "api", "post", "get", "authorization", "bearer",
+        "websocket", "c2", "callback", "beacon", "download", "upload"
     ]
+
+    if value.lower().startswith(("http://", "https://")):
+        url_info = classify_url_candidate(value)
+
+        if url_info.get("valid"):
+            return "high"
+
+        return "low"
 
     if any(term in lowered for term in terms):
         return "medium"
-
-    if value.lower().startswith(("http://", "https://")):
-        return "high"
 
     return "low"
 
@@ -1908,7 +2145,12 @@ def add_string_match(results, name, value, source, start_index, section_ranges_v
             return
 
         item["ip_type"] = classification
-        item["confidence"] = "high" if classification == "public" else "low"
+
+        if classification == "public" and network_context_score(value, source["value"]) in {"medium", "high"}:
+            item["confidence"] = "high"
+            item["context"] = "near_network_terms"
+        else:
+            item["confidence"] = "low"
 
     elif name == "domains":
         filtered = filter_domain_candidate(value)
@@ -1927,13 +2169,22 @@ def add_string_match(results, name, value, source, start_index, section_ranges_v
             item["confidence"] = network_context_score(filtered, source["value"])
 
     elif name == "urls":
-        noise_reason = noisy_network_reason(value, item.get("origin"))
+        url_info = classify_url_candidate(value)
+        item["value"] = url_info.get("value", value)
+        item["preview"] = preview(item["value"])
+        item["url_host"] = url_info.get("host")
+        item["url_type"] = "valid_url" if url_info.get("valid") else "malformed_or_template_url"
+
+        noise_reason = noisy_network_reason(item["value"], item.get("origin"))
 
         if noise_reason:
             item["confidence"] = "noise"
             item["noise_reason"] = noise_reason
-        else:
+        elif url_info.get("valid"):
             item["confidence"] = "high"
+        else:
+            item["confidence"] = "low"
+            item["parse_reason"] = url_info.get("reason")
 
     else:
         item["confidence"] = "medium"
@@ -1945,7 +2196,7 @@ def unique_string_items(items, max_items):
     result = []
     seen = set()
 
-    for item in sorted(items, key=lambda x: (x.get("value", ""), x.get("offset_int", 0))):
+    for item in sorted(items, key=string_item_sort_key):
         marker = (item.get("value"), item.get("origin"), item.get("encoding"))
 
         if marker in seen:
@@ -1981,6 +2232,203 @@ def decode_hex_candidate(value):
         return None
 
 
+
+
+def runtime_marker_scan(string_entries, max_evidence_per_family=10):
+    results = {}
+
+    for family in RUNTIME_MARKERS:
+        results[family] = {
+            "count": 0,
+            "evidence": []
+        }
+
+    for source in string_entries:
+        value = source.get("value", "")
+        lowered = value.lower()
+
+        for family, markers in RUNTIME_MARKERS.items():
+            matched_marker = None
+
+            for marker in markers:
+                if marker in lowered:
+                    matched_marker = marker
+                    break
+
+            if not matched_marker:
+                continue
+
+            results[family]["count"] += 1
+
+            if len(results[family]["evidence"]) < max_evidence_per_family:
+                results[family]["evidence"].append({
+                    "marker": matched_marker,
+                    "value": preview(value),
+                    "offset": hex(source.get("offset", 0)),
+                    "encoding": source.get("encoding")
+                })
+
+    return {
+        family: data for family, data in results.items()
+        if data["count"] > 0
+    }
+
+
+def string_noise_profile(stats):
+    ascii_count = stats.get("ascii_string_count", 0) or 0
+    utf16_count = stats.get("utf16le_string_count", 0) or 0
+    unique_count = stats.get("unique_combined_string_count", 0) or 0
+    longest = stats.get("longest_string_length", 0) or 0
+    base64_count = stats.get("base64_like_total_count", 0) or 0
+    hex_count = stats.get("hex_like_total_count", 0) or 0
+    reasons = []
+
+    if ascii_count + utf16_count >= 100000:
+        reasons.append("very large string corpus")
+
+    if unique_count >= 100000:
+        reasons.append("very high unique string count")
+
+    if longest >= 500000:
+        reasons.append("very long embedded string/blob")
+
+    if base64_count >= 1000:
+        reasons.append("many base64-like candidates")
+
+    if hex_count >= 1000:
+        reasons.append("many hex-like candidates")
+
+    return {
+        "is_large_noisy": bool(reasons),
+        "reasons": reasons,
+        "ascii_plus_utf16_count": ascii_count + utf16_count
+    }
+
+
+def decoded_string_runtime_markers(strings):
+    joined = "\n".join(strings).lower()
+    hits = []
+
+    for family, markers in RUNTIME_MARKERS.items():
+        for marker in markers:
+            if marker in joined:
+                hits.append(f"{family}:{marker}")
+
+                if len(hits) >= 10:
+                    return hits
+
+    wasm_specific = ["__wbindgen", "__heap_base", "wasm_", "memory", "parsecjs"]
+
+    for marker in wasm_specific:
+        if marker in joined and marker not in hits:
+            hits.append(f"wasm:{marker}")
+
+    return hits[:10]
+
+
+def assess_decoded_blob(item, decoded_strings):
+    reasons = []
+    content_type = "generic_decoded_data"
+    runtime_hits = decoded_string_runtime_markers(decoded_strings)
+    valid_urls = []
+
+    for url in item.get("urls", []):
+        url_info = classify_url_candidate(url)
+
+        if url_info.get("valid") and not noisy_network_reason(url_info.get("value", url)):
+            valid_urls.append(url_info.get("value", url))
+
+    public_ips = [ip for ip in item.get("ipv4", []) if ip.get("type") == "public"]
+    domains = [domain for domain in item.get("domains", []) if not noisy_network_reason(domain)]
+    high_signal_magic = []
+    magic_at_start = item.get("magic_hint")
+
+    for hit in item.get("embedded_magic_hits", []):
+        magic = hit.get("magic")
+
+        if magic == "PE/MZ" and hit.get("valid_pe"):
+            high_signal_magic.append(f"valid embedded PE at {hit.get('offset')}")
+        elif magic in {"ELF", "ZIP", "7z", "RAR", "CAB", "OLE/CFB", "PDF"}:
+            high_signal_magic.append(f"embedded {magic} at {hit.get('offset')}")
+        elif magic == "GZIP" and magic_at_start == "GZIP":
+            high_signal_magic.append("decoded blob starts with GZIP")
+
+    if runtime_hits:
+        reasons.append("runtime/WASM markers: " + ", ".join(runtime_hits[:5]))
+
+    if magic_at_start == "WASM" or (runtime_hits and any("wasm" in hit.lower() or "__wbindgen" in hit.lower() for hit in runtime_hits)):
+        content_type = "wasm_or_runtime_blob"
+        if magic_at_start == "WASM":
+            reasons.append("magic at decoded start: WASM")
+        return {
+            "content_type": content_type,
+            "interesting": False,
+            "triage_interesting": True,
+            "suspicious": False,
+            "confidence": "high" if magic_at_start == "WASM" else "medium",
+            "reasons": reasons
+        }
+
+    if magic_at_start in {"PE/MZ", "ELF", "ZIP", "7z", "RAR", "CAB", "OLE/CFB", "PDF"}:
+        high_signal_magic.insert(0, f"magic at decoded start: {magic_at_start}")
+
+    if high_signal_magic:
+        content_type = "embedded_file_or_payload_candidate"
+        reasons.extend(high_signal_magic[:5])
+        return {
+            "content_type": content_type,
+            "interesting": True,
+            "triage_interesting": True,
+            "suspicious": True,
+            "confidence": "high" if any("valid embedded PE" in reason for reason in high_signal_magic) else "medium",
+            "reasons": reasons
+        }
+
+    if valid_urls or domains or public_ips:
+        content_type = "indicator_or_config_candidate"
+        reasons.append(
+            f"decoded indicators: urls={len(valid_urls)}, domains={len(domains)}, public_ipv4={len(public_ips)}"
+        )
+        return {
+            "content_type": content_type,
+            "interesting": True,
+            "triage_interesting": True,
+            "suspicious": False,
+            "confidence": "medium",
+            "reasons": reasons
+        }
+
+    if item.get("decoded_entropy", 0) >= 7.2 and item.get("decoded_size", 0) >= 1024 and not runtime_hits:
+        content_type = "compressed_or_encrypted_candidate"
+        reasons.append("high entropy decoded data")
+        return {
+            "content_type": content_type,
+            "interesting": True,
+            "triage_interesting": True,
+            "suspicious": False,
+            "confidence": "medium",
+            "reasons": reasons
+        }
+
+    if runtime_hits:
+        return {
+            "content_type": "runtime_or_library_data",
+            "interesting": False,
+            "triage_interesting": True,
+            "suspicious": False,
+            "confidence": "medium",
+            "reasons": reasons
+        }
+
+    return {
+        "content_type": content_type,
+        "interesting": False,
+        "triage_interesting": False,
+        "suspicious": False,
+        "confidence": "low",
+        "reasons": reasons
+    }
+
 def scan_decoded_blob(decoded, blob_type):
     strings = [item["value"] for item in extract_ascii_strings(decoded, min_len=5)[:200]]
     joined = "\n".join(strings)
@@ -2009,7 +2457,7 @@ def scan_decoded_blob(decoded, blob_type):
         if len(domains) >= 10:
             break
 
-    return {
+    item = {
         "type": blob_type,
         "decoded_size": len(decoded),
         "decoded_entropy": round(entropy(decoded), 2),
@@ -2019,9 +2467,13 @@ def scan_decoded_blob(decoded, blob_type):
         "urls": urls,
         "ipv4": ipv4,
         "domains": domains,
-        "sample_strings": [preview(s, 100) for s in strings[:10]]
+        "sample_strings": [preview(value, 100) for value in strings[:10]]
     }
+    item["assessment"] = assess_decoded_blob(item, strings)
+    item["interesting"] = item["assessment"].get("interesting", False)
+    item["content_type"] = item["assessment"].get("content_type")
 
+    return item
 
 def encoded_blob_candidates(string_entries, section_ranges_value, resource_ranges, overlay, certificate, max_candidates=20):
     candidates = []
@@ -2133,6 +2585,7 @@ def interesting_string_scan(path, pe, resources, overlay, certificate, max_items
 
     results["keyword_hits"] = keyword_hits
     results["encoded_blobs"] = encoded_blob_candidates(string_entries, section_ranges_value, resource_ranges, overlay, certificate)
+    results["runtime_markers"] = runtime_marker_scan(string_entries)
     results["stats"] = {
         "ascii_string_count": len(ascii_strings),
         "utf16le_string_count": len(wide_strings),
@@ -2143,6 +2596,7 @@ def interesting_string_scan(path, pe, resources, overlay, certificate, max_items
         "base64_like_longest_length": base64_longest,
         "hex_like_longest_length": hex_longest
     }
+    results["string_noise_profile"] = string_noise_profile(results["stats"])
 
     return results
 
@@ -2210,22 +2664,303 @@ def collect_artifacts(summary):
 
 
 def network_indicator_counts(strings):
-    urls = [item for item in strings.get("urls", []) if item.get("confidence") != "noise"]
+    urls = [item for item in strings.get("urls", []) if item.get("confidence") in {"medium", "high"}]
+    low_urls = [item for item in strings.get("urls", []) if item.get("confidence") == "low"]
     noisy_urls = [item for item in strings.get("urls", []) if item.get("confidence") == "noise"]
-    public_ips = [item for item in strings.get("ipv4", []) if item.get("ip_type") == "public"]
+    public_ips = [item for item in strings.get("ipv4", []) if item.get("ip_type") == "public" and item.get("confidence") in {"medium", "high"}]
+    low_public_ips = [item for item in strings.get("ipv4", []) if item.get("ip_type") == "public" and item.get("confidence") == "low"]
     medium_high_domains = [item for item in strings.get("domains", []) if item.get("confidence") in {"medium", "high"}]
     low_domains = [item for item in strings.get("domains", []) if item.get("confidence") == "low"]
     noisy_domains = [item for item in strings.get("domains", []) if item.get("confidence") == "noise"]
 
     return {
         "urls": len(urls),
+        "low_confidence_urls": len(low_urls),
         "public_ipv4": len(public_ips),
+        "low_confidence_public_ipv4": len(low_public_ips),
         "medium_high_domains": len(medium_high_domains),
         "low_confidence_domains": len(low_domains),
         "noisy_urls": len(noisy_urls),
         "noisy_domains": len(noisy_domains)
     }
 
+
+
+
+def runtime_marker_evidence(strings, family, limit=5):
+    markers = strings.get("runtime_markers", {}).get(family, {})
+    evidence = []
+
+    for item in markers.get("evidence", [])[:limit]:
+        evidence.append(f"{item.get('marker')} at {item.get('offset')}: {item.get('value')}")
+
+    return evidence
+
+
+def resource_name_contains(resources, text):
+    text_lower = text.lower()
+    matches = []
+
+    if not resources:
+        return matches
+
+    for item in resources.get("items", []):
+        joined = " ".join(str(item.get(key, "")) for key in [
+            "resource_path", "resource_raw_path", "resource_type", "resource_name"
+        ]).lower()
+
+        if text_lower in joined:
+            matches.append(item)
+
+    return matches
+
+
+def all_visible_string_values(summary):
+    values = []
+    strings = summary.get("strings", {})
+
+    for key in ["urls", "domains", "emails", "registry_paths", "windows_paths", "unc_paths", "named_pipes", "pdb_paths"]:
+        for item in strings.get(key, []):
+            if item.get("value"):
+                values.append(str(item.get("value")))
+
+    for category_values in strings.get("keyword_hits", {}).values():
+        for item in category_values:
+            if item.get("value"):
+                values.append(str(item.get("value")))
+
+    for item in summary.get("key_artifacts", []):
+        if item.get("value"):
+            values.append(str(item.get("value")))
+
+    return values
+
+
+def visible_strings_contain(summary, terms):
+    joined = "\n".join(all_visible_string_values(summary)).lower()
+    return any(term.lower() in joined for term in terms)
+
+
+
+
+def is_low_signal_reference_url(item):
+    value = item.get("value", "") if isinstance(item, dict) else str(item)
+    info = classify_url_candidate(value)
+
+    if not info.get("valid"):
+        return True
+
+    host = (info.get("host") or "").lower().strip(".")
+
+    if host in {"localhost", "127.0.0.1", "0.0.0.0"}:
+        return True
+
+    if any(host == suffix or host.endswith("." + suffix) for suffix in LOW_SIGNAL_URL_HOST_SUFFIXES):
+        return True
+
+    try:
+        path = urlparse(info.get("value", value)).path.lower()
+    except Exception:
+        path = ""
+
+    if any(keyword in path for keyword in LOW_SIGNAL_URL_PATH_KEYWORDS):
+        return True
+
+    return False
+
+def strong_network_evidence(summary):
+    strings = summary.get("strings", {})
+    runtime = summary.get("runtime_context", {})
+    actionable_urls = [
+        item for item in strings.get("urls", [])
+        if item.get("confidence") in {"medium", "high"} and not is_low_signal_reference_url(item)
+    ]
+    actionable_domains = [
+        item for item in strings.get("domains", [])
+        if item.get("confidence") in {"medium", "high", "high"} and not noisy_network_reason(item.get("value", ""), item.get("origin"))
+    ]
+
+    if actionable_urls:
+        return True
+
+    if runtime.get("is_runtime_heavy"):
+        return False
+
+    if actionable_domains:
+        return True
+
+    contextual_public_ips = [
+        item for item in strings.get("ipv4", [])
+        if item.get("ip_type") == "public" and item.get("confidence") in {"medium", "high"}
+    ]
+
+    return bool(contextual_public_ips)
+
+
+def process_dump_targeting_evidence(summary):
+    return visible_strings_contain(summary, [
+        "lsass", "lsass.exe", "minidump", "procdump", "sedebugprivilege", "comsvcs.dll"
+    ])
+
+
+def detect_runtime_context(summary):
+    resources = summary.get("resources") or {}
+    strings = summary.get("strings", {})
+    imports = summary.get("imports", {})
+    delay_imports = summary.get("delay_imports") or {}
+    file_size = summary.get("file", {}).get("size_bytes", 0) or 0
+    stats = strings.get("stats", {})
+    families = []
+
+    node_evidence = []
+
+    for item in resource_name_contains(resources, "NODE_SEA_BLOB"):
+        node_evidence.append(f"resource {item.get('resource_path')} size={item.get('size')}")
+
+    for dll in delay_imports.get("dlls", []):
+        if str(dll).lower() == "node.exe":
+            node_evidence.append("delay import node.exe")
+
+    for item in summary.get("debug", []):
+        if "node.pdb" in str(item.get("pdb_path", "")).lower():
+            node_evidence.append(f"debug PDB {item.get('pdb_path')}")
+
+    for item in strings.get("pdb_paths", []):
+        if "node.pdb" in str(item.get("value", "")).lower():
+            node_evidence.append(f"PDB string {item.get('value')}")
+
+    node_marker_count = strings.get("runtime_markers", {}).get("node_v8", {}).get("count", 0)
+
+    if node_marker_count:
+        node_evidence.append(f"node/v8 runtime string markers={node_marker_count}")
+        node_evidence.extend(runtime_marker_evidence(strings, "node_v8", limit=4))
+
+    if node_evidence:
+        families.append({
+            "name": "node_v8_or_node_sea",
+            "confidence": "high" if resource_name_contains(resources, "NODE_SEA_BLOB") or node_marker_count >= 5 else "medium",
+            "evidence": dedupe_keep_order(node_evidence)[:10]
+        })
+
+    electron_evidence = []
+    electron_marker_count = strings.get("runtime_markers", {}).get("electron_chromium", {}).get("count", 0)
+
+    if electron_marker_count:
+        electron_evidence.append(f"electron/chromium markers={electron_marker_count}")
+        electron_evidence.extend(runtime_marker_evidence(strings, "electron_chromium", limit=5))
+
+    if electron_evidence:
+        families.append({
+            "name": "electron_or_chromium_bundle",
+            "confidence": "medium",
+            "evidence": dedupe_keep_order(electron_evidence)[:10]
+        })
+
+    pyinstaller_evidence = []
+    pyinstaller_marker_count = strings.get("runtime_markers", {}).get("pyinstaller", {}).get("count", 0)
+
+    if pyinstaller_marker_count:
+        pyinstaller_evidence.append(f"pyinstaller markers={pyinstaller_marker_count}")
+        pyinstaller_evidence.extend(runtime_marker_evidence(strings, "pyinstaller", limit=5))
+
+    if pyinstaller_evidence:
+        families.append({
+            "name": "pyinstaller_bundle",
+            "confidence": "medium",
+            "evidence": dedupe_keep_order(pyinstaller_evidence)[:10]
+        })
+
+    go_evidence = []
+    go_marker_count = strings.get("runtime_markers", {}).get("go_runtime", {}).get("count", 0)
+
+    if go_marker_count:
+        go_evidence.append(f"go runtime markers={go_marker_count}")
+        go_evidence.extend(runtime_marker_evidence(strings, "go_runtime", limit=5))
+
+    if go_evidence:
+        families.append({
+            "name": "go_runtime",
+            "confidence": "medium",
+            "evidence": dedupe_keep_order(go_evidence)[:10]
+        })
+
+    string_noise = strings.get("string_noise_profile", {})
+    large_runtime_shape = (
+        file_size >= 20 * 1024 * 1024 or
+        (stats.get("ascii_string_count", 0) or 0) + (stats.get("utf16le_string_count", 0) or 0) >= 100000 or
+        imports.get("import_count", 0) >= 300
+    )
+
+    return {
+        "detected": bool(families),
+        "is_runtime_heavy": bool(families and large_runtime_shape),
+        "families": families,
+        "large_runtime_shape": large_runtime_shape,
+        "string_noise_profile": string_noise,
+        "notes": [
+            "Generic imports and strings may reflect bundled runtime capability rather than sample-specific behavior."
+        ] if families and large_runtime_shape else []
+    }
+
+
+def adjust_api_finding_for_context(finding, summary):
+    runtime = summary.get("runtime_context", {})
+
+    if not runtime.get("is_runtime_heavy"):
+        return finding
+
+    finding_id = finding.get("id")
+    adjusted = dict(finding)
+    adjusted["evidence"] = list(finding.get("evidence", []))
+    adjusted["context_adjusted"] = True
+    adjusted["original_severity"] = finding.get("severity")
+    adjusted["original_confidence"] = finding.get("confidence")
+
+    context_note = "large bundled/runtime-heavy binary detected; import may reflect runtime capability"
+
+    if finding_id in {"api_downloader_file_write", "api_downloader_execute"} and not strong_network_evidence(summary):
+        adjusted["severity"] = "medium" if finding.get("severity") == "high" else "low"
+        adjusted["confidence"] = "low"
+        adjusted["title"] = finding.get("title", "API finding") + " (runtime-capability context)"
+        adjusted["evidence"].append(context_note)
+        adjusted["recommendation"] = "Treat as weak until concrete URL/C2/config or downloaded-execution logic is found."
+        return adjusted
+
+    if finding_id == "api_process_dumping" and not process_dump_targeting_evidence(summary):
+        adjusted["severity"] = "medium"
+        adjusted["confidence"] = "low"
+        adjusted["title"] = "Process dumping import (runtime-capability context)"
+        adjusted["evidence"].append(context_note)
+        adjusted["recommendation"] = "Treat as capability only unless LSASS/process-dump targeting evidence is present."
+        return adjusted
+
+    if finding_id == "api_dynamic_resolution":
+        adjusted["severity"] = "low"
+        adjusted["confidence"] = "low"
+        adjusted["title"] = "Dynamic API resolution imports (common in bundled runtimes)"
+        adjusted["evidence"].append(context_note)
+        adjusted["recommendation"] = "Keep as context; prioritize resolved suspicious API-name strings instead."
+        return adjusted
+
+    if finding_id == "api_anti_debugging":
+        adjusted["confidence"] = "low"
+        adjusted["evidence"].append(context_note)
+        return adjusted
+
+    return finding
+
+
+def adjust_api_combination_findings_for_context(summary):
+    imports = summary.get("imports", {})
+    findings = imports.get("api_combination_findings", [])
+
+    if not findings:
+        return
+
+    imports["api_combination_findings"] = sorted(
+        [adjust_api_finding_for_context(finding, summary) for finding in findings],
+        key=finding_sort_key
+    )
 
 def generate_findings(summary):
     findings = []
@@ -2241,6 +2976,37 @@ def generate_findings(summary):
     execute_write_sections = [s["name"] for s in sections if "EXECUTE_WRITE" in s.get("flags", [])]
     suspicious_name_sections = [s["name"] for s in sections if "SUSPICIOUS_NAME" in s.get("flags", [])]
     structural_flags = []
+    runtime_context = summary.get("runtime_context", {})
+
+    if runtime_context.get("is_runtime_heavy"):
+        evidence = []
+
+        for family in runtime_context.get("families", [])[:4]:
+            evidence.append(f"{family.get('name')} ({family.get('confidence')} confidence)")
+
+            for item in family.get("evidence", [])[:3]:
+                evidence.append(item)
+
+        add_finding(
+            findings,
+            "runtime_heavy_bundle_detected",
+            "info",
+            "high",
+            "Runtime-heavy or bundled binary detected",
+            evidence[:10],
+            "Treat generic imports and broad string hits as runtime capability until supported by concrete sample-specific evidence."
+        )
+
+    if strings.get("string_noise_profile", {}).get("is_large_noisy"):
+        add_finding(
+            findings,
+            "strings_large_noisy_corpus",
+            "info",
+            "high",
+            "Large/noisy string corpus detected",
+            strings.get("string_noise_profile", {}).get("reasons", []),
+            "Prioritize high-confidence URLs, validated embedded files, resources, and config-like strings over broad regex hits."
+        )
 
     for section in sections:
         relevant = [
@@ -2442,61 +3208,117 @@ def generate_findings(summary):
             "Inspect or carve overlay data."
         )
 
-    if resources and resources.get("interesting_resources"):
-        high_resources = [item for item in resources["interesting_resources"] if item.get("priority") == "high"]
-        severity = "high" if high_resources else "medium"
+    node_sea_resources = resource_name_contains(resources, "NODE_SEA_BLOB") if resources else []
+
+    if node_sea_resources:
         evidence = []
 
-        for item in resources["interesting_resources"][:10]:
-            reason_text = "; ".join(item.get("priority_reasons", [])) or "-"
+        for item in node_sea_resources[:5]:
             evidence.append(
-                f"path={item.get('resource_path')}, raw_path={item.get('resource_raw_path')}, "
-                f"type={item.get('resource_type')}, name={item.get('resource_name')}, lang={item.get('resource_language')}, "
-                f"size={item.get('size')}, entropy={item.get('entropy')}, magic={item.get('magic_hint')}, "
-                f"priority={item.get('priority')}, reason={reason_text}"
+                f"path={item.get('resource_path')}, size={item.get('size')}, entropy={item.get('entropy')}, "
+                f"file_offset={item.get('file_offset')}"
             )
 
         add_finding(
             findings,
-            "resources_interesting",
-            severity,
+            "resource_node_sea_blob",
             "medium",
-            "Interesting resource data found",
+            "high",
+            "Node SEA blob resource found",
             evidence,
-            "Inspect high-entropy, large, or embedded-magic resources for payloads/configuration."
+            "Extract and inspect the Node SEA blob / embedded JavaScript content."
         )
+
+    if resources and resources.get("interesting_resources"):
+        covered_resource_paths = set()
+
+        if node_sea_resources:
+            covered_resource_paths.update(item.get("resource_path") for item in node_sea_resources if item.get("resource_path"))
+
+        uncovered_interesting = [
+            item for item in resources.get("interesting_resources", [])
+            if item.get("resource_path") not in covered_resource_paths
+        ]
+
+        if uncovered_interesting:
+            high_resources = [item for item in uncovered_interesting if item.get("priority") == "high"]
+            severity = "high" if high_resources else "medium"
+            evidence = []
+
+            for item in uncovered_interesting[:10]:
+                reason_text = "; ".join(item.get("priority_reasons", [])) or "-"
+                evidence.append(
+                    f"path={item.get('resource_path')}, raw_path={item.get('resource_raw_path')}, "
+                    f"type={item.get('resource_type')}, name={item.get('resource_name')}, lang={item.get('resource_language')}, "
+                    f"size={item.get('size')}, entropy={item.get('entropy')}, magic={item.get('magic_hint')}, "
+                    f"priority={item.get('priority')}, reason={reason_text}"
+                )
+
+            add_finding(
+                findings,
+                "resources_interesting",
+                severity,
+                "medium",
+                "Interesting resource data found",
+                evidence,
+                "Inspect high-entropy, large, or embedded-magic resources for payloads/configuration."
+            )
 
     encoded_blobs = strings.get("encoded_blobs", [])
     encoded_evidence = []
+    runtime_blob_evidence = []
     encoded_severity = "medium"
+    encoded_confidence = "medium"
 
     for blob in encoded_blobs:
-        if blob.get("magic_hint") or blob.get("embedded_magic_hits") or blob.get("urls") or blob.get("domains") or blob.get("ipv4"):
-            encoded_evidence.append(
-                f"{blob.get('type')} at {blob.get('source_offset')} origin={blob.get('source_origin')} magic={blob.get('magic_hint')} size={blob.get('decoded_size')}"
-            )
+        assessment = blob.get("assessment", {})
+        reasons = "; ".join(assessment.get("reasons", [])[:3]) or "decoded content"
+        evidence_text = (
+            f"{blob.get('type')} at {blob.get('source_offset')} origin={blob.get('source_origin')} "
+            f"content_type={assessment.get('content_type')} size={blob.get('decoded_size')} "
+            f"suspicious={assessment.get('suspicious')} reason={reasons}"
+        )
 
-            if blob.get("magic_hint") == "PE/MZ" or any(hit.get("magic") == "PE/MZ" for hit in blob.get("embedded_magic_hits", [])):
+        if assessment.get("interesting"):
+            encoded_evidence.append(evidence_text)
+
+            if assessment.get("confidence") == "high":
                 encoded_severity = "high"
+                encoded_confidence = "high"
+        elif assessment.get("triage_interesting"):
+            runtime_blob_evidence.append(evidence_text)
 
     if encoded_evidence:
         add_finding(
             findings,
             "encoded_blob_interesting",
             encoded_severity,
-            "medium",
-            "Encoded blob decodes to interesting content",
+            encoded_confidence,
+            "Encoded blob decodes to potentially actionable content",
             encoded_evidence[:10],
-            "Review decoded blob output and carve it if it contains embedded magic or indicators."
+            "Review decoded blob output and carve it if it contains validated embedded files, config, or indicators."
+        )
+
+    if runtime_blob_evidence:
+        add_finding(
+            findings,
+            "encoded_blob_runtime_or_wasm",
+            "info",
+            "high",
+            "Decoded runtime/WASM blob found",
+            runtime_blob_evidence[:10],
+            "Useful for understanding the bundled runtime; do not treat as suspicious without additional evidence."
         )
 
     counts = network_indicator_counts(strings)
 
     if counts["urls"] or counts["public_ipv4"] or counts["medium_high_domains"]:
         evidence = [
-            f"urls={counts['urls']}",
-            f"public_ipv4={counts['public_ipv4']}",
+            f"valid_urls={counts['urls']}",
+            f"public_ipv4_with_network_context={counts['public_ipv4']}",
             f"medium_high_domains={counts['medium_high_domains']}",
+            f"low_confidence_urls={counts['low_confidence_urls']}",
+            f"low_confidence_public_ipv4={counts['low_confidence_public_ipv4']}",
             f"low_confidence_domains={counts['low_confidence_domains']}",
             f"noisy_urls={counts['noisy_urls']}",
             f"noisy_domains={counts['noisy_domains']}"
@@ -2573,7 +3395,7 @@ def generate_findings(summary):
             "Use .NET-specific tooling if deeper analysis is needed."
         )
 
-    ordered = sorted(findings, key=lambda item: (severity_rank(item.get("severity")), confidence_rank(item.get("confidence")), item.get("id", "")))
+    ordered = sorted(findings, key=finding_sort_key)
 
     return dedupe_keep_order(ordered)
 
@@ -2640,8 +3462,14 @@ def recommended_next_steps(summary):
         steps.append("Run FLOSS because packing or dynamic string/API resolution is plausible")
         steps.append("Consider unpacking or dumping if the sample executes safely in a controlled lab")
 
+    if "runtime_heavy_bundle_detected" in ids:
+        steps.append("Account for bundled-runtime noise before treating generic imports or broad strings as behavior")
+
     if "encoded_blob_interesting" in ids:
         steps.append("Review decoded base64/hex blob output and carve decoded payloads if useful")
+
+    if "resource_node_sea_blob" in ids:
+        steps.append("Extract and inspect the Node SEA blob / embedded JavaScript content")
 
     if "resources_interesting" in ids:
         steps.append("Inspect high-entropy, large, or embedded-magic resources for payloads or config")
@@ -2711,6 +3539,8 @@ def summarize(path):
     }
 
     summary["strings"] = module_run("interesting_string_scan", lambda: interesting_string_scan(path, pe, resources, overlay, certificate), {}, warnings)
+    summary["runtime_context"] = module_run("runtime_context", lambda: detect_runtime_context(summary), {}, warnings)
+    adjust_api_combination_findings_for_context(summary)
     summary["key_artifacts"] = collect_artifacts(summary)
     summary["findings"] = generate_findings(summary)
     summary["triage_verdict"] = triage_verdict(summary)
@@ -2730,6 +3560,8 @@ def format_chat_summary(summary):
     oh = summary["optional_header"]
     ep = summary["entry_point"]
 
+    lines.append("SUMMARY")
+    lines.append("-" * 80)
     lines.append(
         f"{file_info.get('name')} is a {fh.get('machine')} PE with subsystem "
         f"{oh.get('subsystem')}."
@@ -2741,6 +3573,13 @@ def format_chat_summary(summary):
         f"(entropy={ep.get('section_entropy')}, flags={', '.join(ep.get('section_flags', [])) or '-'})"
     )
 
+    runtime = summary.get("runtime_context", {})
+
+    if runtime.get("detected"):
+        family_names = ", ".join(family.get("name") for family in runtime.get("families", [])[:3])
+        heavy_text = "runtime-heavy" if runtime.get("is_runtime_heavy") else "runtime markers"
+        lines.append(f"Runtime context: {heavy_text} ({family_names})")
+
     if summary.get("dotnet", {}).get("is_dotnet"):
         lines.append("Runtime: .NET/CLR header present")
 
@@ -2751,8 +3590,9 @@ def format_chat_summary(summary):
     counts = network_indicator_counts(summary.get("strings", {}))
     lines.append(
         "String network candidates: "
-        f"urls={counts['urls']}, public_ipv4={counts['public_ipv4']}, "
-        f"medium_high_domains={counts['medium_high_domains']}, low_confidence_domains={counts['low_confidence_domains']}, "
+        f"valid_urls={counts['urls']}, contextual_public_ipv4={counts['public_ipv4']}, "
+        f"medium_high_domains={counts['medium_high_domains']}, low_urls={counts['low_confidence_urls']}, "
+        f"low_public_ipv4={counts['low_confidence_public_ipv4']}, low_domains={counts['low_confidence_domains']}, "
         f"noisy_urls={counts['noisy_urls']}, noisy_domains={counts['noisy_domains']}"
     )
 
@@ -2777,24 +3617,67 @@ def format_finding(lines, finding):
 def format_string_items(lines, label, values):
     lines.append(f"{label}:")
 
-    if values:
-        for item in values:
-            confidence = item.get("confidence")
-            suffix_parts = [item.get("offset"), item.get("origin"), item.get("encoding")]
-
-            if confidence:
-                suffix_parts.append(f"confidence={confidence}")
-
-            if item.get("ip_type"):
-                suffix_parts.append(f"type={item.get('ip_type')}")
-
-            if item.get("noise_reason"):
-                suffix_parts.append(f"noise={item.get('noise_reason')}")
-
-            suffix = ", ".join(str(x) for x in suffix_parts if x)
-            lines.append(f"  {preview(item.get('value'))} [{suffix}]")
-    else:
+    if not values:
         lines.append("  None")
+        return
+
+    ordered_values = sorted(values, key=string_item_sort_key)
+    groups = []
+    current_label = None
+    current_items = []
+
+    for item in ordered_values:
+        group_label = string_group_label(item)
+
+        if current_label is None:
+            current_label = group_label
+
+        if group_label != current_label:
+            groups.append((current_label, current_items))
+            current_label = group_label
+            current_items = []
+
+        current_items.append(item)
+
+    if current_items:
+        groups.append((current_label, current_items))
+
+    if len(groups) == 1:
+        for item in groups[0][1]:
+            format_single_string_item(lines, item, indent="  ")
+        return
+
+    for group_label, group_items in groups:
+        lines.append(f"  {group_label}:")
+
+        for item in group_items:
+            format_single_string_item(lines, item, indent="    ")
+
+
+def format_single_string_item(lines, item, indent="  "):
+    confidence = item.get("confidence")
+    suffix_parts = [item.get("offset"), item.get("origin"), item.get("encoding")]
+
+    if confidence:
+        suffix_parts.append(f"confidence={confidence}")
+
+    if item.get("ip_type"):
+        suffix_parts.append(f"type={item.get('ip_type')}")
+
+    if item.get("url_type"):
+        suffix_parts.append(item.get("url_type"))
+
+    if item.get("context"):
+        suffix_parts.append(f"context={item.get('context')}")
+
+    if item.get("parse_reason"):
+        suffix_parts.append(f"parse={item.get('parse_reason')}")
+
+    if item.get("noise_reason"):
+        suffix_parts.append(f"noise={item.get('noise_reason')}")
+
+    suffix = ", ".join(str(x) for x in suffix_parts if x)
+    lines.append(f"{indent}{preview(item.get('value'))} [{suffix}]")
 
 
 def format_text(summary):
@@ -2804,7 +3687,6 @@ def format_text(summary):
 
     lines.append("PE TRIAGE SUMMARY")
     lines.append("=" * 80)
-    lines.append("")
     lines.extend(format_chat_summary(summary))
 
     lines.append("WHAT TO INSPECT FIRST")
@@ -2863,6 +3745,32 @@ def format_text(summary):
         lines.append("No key artifacts found")
     lines.append("")
 
+    lines.append("RUNTIME / BUNDLE CONTEXT")
+    lines.append("-" * 80)
+    runtime = summary.get("runtime_context", {})
+
+    if runtime.get("detected"):
+        lines.append(f"Runtime-heavy: {runtime.get('is_runtime_heavy')}")
+
+        for family in runtime.get("families", []):
+            lines.append(f"{family.get('name')}: confidence={family.get('confidence')}")
+
+            for evidence in family.get("evidence", [])[:5]:
+                lines.append(f"  {preview(evidence)}")
+
+        if runtime.get("notes"):
+            for note in runtime.get("notes"):
+                lines.append(f"Note: {note}")
+    else:
+        lines.append("No bundled-runtime context detected")
+
+    noise_profile = summary.get("strings", {}).get("string_noise_profile", {})
+
+    if noise_profile.get("is_large_noisy"):
+        lines.append("String noise profile: " + ", ".join(noise_profile.get("reasons", [])))
+
+    lines.append("")
+
     lines.append("INTERESTING STRING CANDIDATES")
     lines.append("-" * 80)
     strings = summary.get("strings", {})
@@ -2905,12 +3813,23 @@ def format_text(summary):
     lines.append("-" * 80)
 
     if strings.get("encoded_blobs"):
-        for blob in strings["encoded_blobs"]:
+        for blob in sorted(strings["encoded_blobs"], key=encoded_blob_sort_key):
             lines.append(
                 f"{blob.get('type')} at {blob.get('source_offset')} ({blob.get('source_origin')}): "
                 f"decoded_size={blob.get('decoded_size')}, entropy={blob.get('decoded_entropy')}, "
                 f"magic={blob.get('magic_hint')}, sha256={blob.get('decoded_sha256')}"
             )
+
+            if blob.get("assessment"):
+                assessment = blob.get("assessment", {})
+                reason_text = "; ".join(assessment.get("reasons", [])) or "-"
+                lines.append(
+                    f"  Assessment: content_type={assessment.get('content_type')}, "
+                    f"interesting={assessment.get('interesting')}, "
+                    f"triage_interesting={assessment.get('triage_interesting')}, "
+                    f"suspicious={assessment.get('suspicious')}, "
+                    f"confidence={assessment.get('confidence')}, reason={preview(reason_text, 180)}"
+                )
 
             if blob.get("embedded_magic_hits"):
                 lines.append(f"  Embedded magic: {blob.get('embedded_magic_hits')}")
@@ -2943,7 +3862,7 @@ def format_text(summary):
     if imports.get("api_combination_findings"):
         lines.append("")
         lines.append("API combination findings:")
-        for finding in imports["api_combination_findings"]:
+        for finding in sorted(imports["api_combination_findings"], key=finding_sort_key):
             format_finding(lines, finding)
 
     if imports.get("capability_imports"):
