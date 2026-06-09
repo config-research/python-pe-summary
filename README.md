@@ -19,8 +19,10 @@ The script creates a text report by default and can optionally also write a deta
 - Overlay, TLS, certificate, and .NET detection
 - Version info and Rich Header information
 - ASCII and UTF-16LE string scanning
+- Confidence-ranked string candidates and findings
 - URL, domain, IP, registry path, file path, UNC path, named pipe, and PDB path candidates
 - Base64/hex blob candidate decoding
+- Runtime/bundled-binary context detection, including Node/V8 and Node SEA artifacts
 - Structured findings and recommended next steps
 
 
