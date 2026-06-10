@@ -4090,8 +4090,130 @@ def default_json_output_path(input_path):
 
     return f"{stem}_pe_details.json"
 
+ANSI_COLORS = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red_bold": "\033[1;31m",
+    "yellow_bold": "\033[1;33m",
+    "green_bold": "\033[1;32m",
+    "blue_bold": "\033[1;34m",
+    "cyan_bold": "\033[1;36m",
+    "magenta_bold": "\033[1;35m",
+}
 
-def print_text_report(content):
+
+def color_enabled():
+    if os.environ.get("NO_COLOR"):
+        return False
+
+    if os.environ.get("FORCE_COLOR"):
+        return True
+
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def color_text(value, color_name, enabled=True):
+    if not enabled:
+        return value
+
+    color = ANSI_COLORS.get(color_name)
+
+    if not color:
+        return value
+
+    return f"{color}{value}{ANSI_COLORS['reset']}"
+
+
+def colorize_report_line(line, enabled=True):
+    if not enabled:
+        return line
+
+    stripped = line.strip()
+
+    if not stripped:
+        return line
+
+    if set(stripped) in [{"="}, {"-"}] and len(stripped) >= 20:
+        return color_text(line, "dim", enabled)
+
+    if stripped.isupper() and len(stripped) <= 80:
+        return color_text(line, "cyan_bold", enabled)
+
+    def severity_replacer(match):
+        severity = match.group(1)
+        confidence = match.group(2)
+
+        severity_color = {
+            "HIGH": "red_bold",
+            "MEDIUM": "yellow_bold",
+            "LOW": "blue_bold",
+            "INFO": "dim",
+        }.get(severity, "bold")
+
+        confidence_color = {
+            "high": "green_bold",
+            "medium": "yellow_bold",
+            "low": "dim",
+        }.get(confidence, "bold")
+
+        return (
+            "["
+            + color_text(severity, severity_color, enabled)
+            + " / "
+            + color_text(confidence, confidence_color, enabled)
+            + "]"
+        )
+
+    line = re.sub(
+        r"\[(HIGH|MEDIUM|LOW|INFO) / (high|medium|low)\]",
+        severity_replacer,
+        line
+    )
+
+    flag_colors = {
+        "EXECUTE_WRITE": "red_bold",
+        "HIGH_ENTROPY": "yellow_bold",
+        "SUSPICIOUS_NAME": "yellow_bold",
+        "UNUSUAL_NAME": "yellow_bold",
+        "RESOURCE_EXECUTABLE": "red_bold",
+        "TEXT_WRITABLE": "red_bold",
+        "RAW_OUTSIDE_FILE": "red_bold",
+        "VIRTUAL_ONLY": "yellow_bold",
+        "LARGE_VIRTUAL_SIZE": "yellow_bold",
+    }
+
+    for flag, color_name in flag_colors.items():
+        line = re.sub(
+            rf"(?<![A-Z0-9_]){re.escape(flag)}(?![A-Z0-9_])",
+            color_text(flag, color_name, enabled),
+            line
+        )
+
+    for prefix, color_name in {
+        "Evidence:": "dim",
+        "Next:": "green_bold",
+        "Verdict note:": "magenta_bold",
+    }.items():
+        if stripped.startswith(prefix):
+            indent_length = len(line) - len(line.lstrip())
+            indent = line[:indent_length]
+            rest = line[indent_length + len(prefix):]
+            return indent + color_text(prefix, color_name, enabled) + rest
+
+    return line
+
+
+def colorize_report(content, enabled=True):
+    return "\n".join(
+        colorize_report_line(line, enabled)
+        for line in content.splitlines()
+    )
+
+def print_text_report(content, use_color=True):
+    if use_color:
+        content = colorize_report(content, enabled=color_enabled())
+
     try:
         sys.stdout.write(content)
         if not content.endswith("\n"):
@@ -4102,7 +4224,6 @@ def print_text_report(content):
         if not content.endswith("\n"):
             sys.stdout.buffer.write(b"\n")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Create a PE malware triage report.")
     parser.add_argument("path", help="PE file to analyze")
@@ -4110,6 +4231,7 @@ def main():
     parser.add_argument("-j", "--json", action="store_true", help="also write detailed JSON report")
     parser.add_argument("--json-output", metavar="PATH", help="JSON report path (default: <sample>_pe_details.json)")
     parser.add_argument("-p", "--print", dest="print_text", action="store_true", help="print text report to console")
+    parser.add_argument("--no-color", action="store_true", help="disable colored console output")
     args = parser.parse_args()
 
     try:
@@ -4139,7 +4261,7 @@ def main():
             f.write(json_content)
 
     if args.print_text:
-        print_text_report(text_content)
+        print_text_report(text_content, use_color=not args.no_color)
 
     print(f"Wrote text report to: {text_output_path}", file=sys.stderr)
 
