@@ -4108,7 +4108,10 @@ def format_text(summary):
         lines.append(f"Ordinal-only export count: {summary['exports']['ordinal_only_export_count']}")
 
         if summary["exports"]["sample_exports"]:
-            lines.append(f"Sample exports: {', '.join(summary['exports']['sample_exports'])}")
+            lines.append("Sample exports:")
+
+            for export_name in summary["exports"]["sample_exports"]:
+                lines.append(f"  - {export_name}")
     else:
         lines.append("No exports found")
     lines.append("")
@@ -4268,6 +4271,57 @@ def html_table(headers, rows):
     )
 
 
+def html_mono_list(items, empty_text="None", limit=None):
+    if not items:
+        return f'<p class="muted">{html_escape(empty_text)}</p>'
+
+    visible_items = list(items[:limit] if limit else items)
+    hidden_count = max(len(items) - len(visible_items), 0)
+    rows = []
+
+    for item in visible_items:
+        rows.append(f"<li>{html_escape(item)}</li>")
+
+    note = ""
+
+    if hidden_count:
+        note = (
+            f'<p class="muted">Showing {len(visible_items)} of {len(items)} items. '
+            f'{hidden_count} hidden.</p>'
+        )
+
+    return (
+        '<ol class="mono-list mono-list-numbered searchable">'
+        + "".join(rows)
+        + "</ol>"
+        + note
+    )
+
+
+def html_exports_section(exports):
+    if not exports:
+        return '<p class="muted">No exports found.</p>'
+
+    parts = [
+        html_kv([
+            ("DLL name", exports.get("dll_name")),
+            ("Export count", exports.get("export_count")),
+            ("Named export count", exports.get("named_export_count")),
+            ("Ordinal-only export count", exports.get("ordinal_only_export_count")),
+        ])
+    ]
+
+    sample_exports = exports.get("sample_exports", [])
+
+    if sample_exports:
+        parts.append('<h3>Sample exports</h3>')
+        parts.append(html_mono_list(sample_exports, empty_text="No named sample exports found"))
+    else:
+        parts.append('<h3>Sample exports</h3><p class="muted">No named sample exports found.</p>')
+
+    return "".join(parts)
+
+
 def html_status_badge(label, value=None, state="content"):
     text = str(label) if value is None else f"{label}: {value}"
     state_value = re.sub(r"[^a-z0-9]+", "-", str(state).lower()).strip("-") or "content"
@@ -4343,6 +4397,10 @@ def html_section_meta(summary, title, visible_limit=None):
 
         if summary.get("debug"):
             badges.append(html_status_badge("debug", len(summary.get("debug", [])), state="content"))
+
+        if summary.get("exports"):
+            export_count = (summary.get("exports") or {}).get("export_count", 0) or 0
+            badges.append(html_status_badge("exports", export_count, state="content" if export_count else "empty"))
 
         if warning_count:
             badges.append(html_status_badge("warnings", warning_count, state="warning"))
@@ -5056,13 +5114,7 @@ def html_metadata(summary):
 
     if exports:
         parts.append('<h3>Exports</h3>')
-        parts.append(html_kv([
-            ("DLL name", exports.get("dll_name")),
-            ("Export count", exports.get("export_count")),
-            ("Named export count", exports.get("named_export_count")),
-            ("Ordinal-only export count", exports.get("ordinal_only_export_count")),
-            ("Sample exports", exports.get("sample_exports")),
-        ]))
+        parts.append(html_exports_section(exports))
 
     if summary.get("parser_warnings"):
         parts.append('<h3>Parser warnings</h3>')
@@ -5122,6 +5174,7 @@ def format_html(summary, text_content=None):
         ".severity-high,.priority-high{background:rgba(239,68,68,.18);color:#fecaca;border-color:rgba(239,68,68,.5)}.severity-medium,.priority-medium{background:rgba(245,158,11,.18);color:#fde68a;border-color:rgba(245,158,11,.5)}.severity-low,.priority-low{background:rgba(59,130,246,.18);color:#bfdbfe;border-color:rgba(59,130,246,.5)}.severity-info,.priority-info{color:var(--muted)}",
         ".confidence-high{background:rgba(34,197,94,.16);color:#bbf7d0}.confidence-medium{background:rgba(245,158,11,.16);color:#fde68a}.confidence-low{background:rgba(156,163,175,.16);color:#e5e7eb}.flag-execute-write,.flag-resource-executable,.flag-text-writable,.flag-raw-outside-file{background:rgba(239,68,68,.18);color:#fecaca}.flag-high-entropy,.flag-suspicious-name,.flag-unusual-name,.flag-virtual-only,.flag-large-virtual-size{background:rgba(245,158,11,.18);color:#fde68a}",
         ".table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;margin:.5rem 0 1rem}th,td{border-bottom:1px solid var(--border);padding:.55rem;text-align:left;vertical-align:top}th{color:#cbd5e1;background:rgba(2,6,23,.45)}table.kv th{width:230px;color:var(--muted)}.evidence-list,.steps,.mini-card ul{padding-left:1.25rem}.recommendation{color:#bbf7d0}.context-note{color:#fde68a}.wrap-list{line-height:1.85}.hidden-by-search{display:none!important}",
+        ".mono-list{margin:.65rem 0 1rem 0;padding:0;list-style:none;display:grid;gap:.35rem}.mono-list li{font-family:Consolas,'Cascadia Mono','Liberation Mono',Menlo,monospace;font-size:.82rem;line-height:1.45;background:rgba(2,6,23,.55);border:1px solid var(--border);border-radius:8px;padding:.45rem .6rem;overflow-wrap:anywhere;word-break:break-word}.mono-list-numbered{counter-reset:item}.mono-list-numbered li::before{counter-increment:item;content:counter(item) '. ';color:var(--muted);font-weight:700;margin-right:.35rem}",
         "@media(max-width:900px){.layout{grid-template-columns:1fr}.sidebar{position:static;height:auto}.main{padding:1rem}details.section>summary{align-items:flex-start;flex-direction:column}.summary-meta{justify-content:flex-start}}",
     ])
     js = "".join([
