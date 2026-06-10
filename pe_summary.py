@@ -4264,7 +4264,7 @@ def html_table(headers, rows):
         body.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
 
     return (
-        '<div class="table-wrap"><table class="data-table searchable-table">'
+        '<div class="table-wrap"><table class="data-table">'
         f"<thead><tr>{head}</tr></thead>"
         f"<tbody>{''.join(body)}</tbody>"
         "</table></div>"
@@ -4291,7 +4291,7 @@ def html_mono_list(items, empty_text="None", limit=None):
         )
 
     return (
-        '<ol class="mono-list mono-list-numbered searchable">'
+        '<ol class="mono-list mono-list-numbered">'
         + "".join(rows)
         + "</ol>"
         + note
@@ -4666,7 +4666,7 @@ def html_findings(summary, limit=None):
             )
 
         cards.append(
-            f'<article class="finding-card severity-border-{html_escape(str(finding.get("severity", "info")).lower())} searchable">'
+            f'<article class="finding-card severity-border-{html_escape(str(finding.get("severity", "info")).lower())}">'
             '<div class="finding-head">'
             f'<div>{html_severity_badges(finding.get("severity"), finding.get("confidence"))}</div>'
             f'<code>{html_escape(finding.get("id"))}</code>'
@@ -4724,7 +4724,7 @@ def html_runtime(summary):
             for item in family.get("evidence", [])[:12]
         )
         cards.append(
-            '<article class="mini-card searchable">'
+            '<article class="mini-card">'
             f'<h3>{html_escape(family.get("name"))} {html_badge(family.get("confidence"), "confidence")}</h3>'
             f'<ul>{evidence}</ul>'
             '</article>'
@@ -4792,7 +4792,7 @@ def html_strings(summary):
                 for item in values[:100]
             ) or '<li class="muted">None</li>'
             cards.append(
-                '<article class="mini-card searchable">'
+                '<article class="mini-card">'
                 f'<h3>{html_escape(category)}</h3><ul>{items}</ul>'
                 '</article>'
             )
@@ -4825,7 +4825,7 @@ def html_encoded_blobs(summary):
                 indicators.append(f"<p><strong>{html_escape(label)}:</strong> <code>{html_escape(values)}</code></p>")
 
         cards.append(
-            '<article class="mini-card searchable">'
+            '<article class="mini-card">'
             '<div class="finding-head">'
             f'{html_badge(blob.get("type"), "artifact")} {html_badge(assessment.get("confidence"), "confidence")}'
             f'<code>{html_escape(blob.get("source_offset"))}</code>'
@@ -4869,7 +4869,7 @@ def html_imports(summary):
         for category, values in imports.get("capability_imports", {}).items():
             items = "".join(f"<li><code>{html_escape(value)}</code></li>" for value in values[:80])
             cards.append(
-                '<article class="mini-card searchable">'
+                '<article class="mini-card">'
                 f'<h3>{html_escape(category)}</h3><ul>{items}</ul>'
                 '</article>'
             )
@@ -5165,7 +5165,6 @@ def format_html(summary, text_content=None):
         ".layout{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;overflow:auto;background:#020617;border-right:1px solid var(--border);padding:1.25rem}",
         ".sidebar h1{font-size:1rem;margin:0 0 .35rem}.subtitle{color:var(--muted);font-size:.82rem;margin-bottom:1rem;word-break:break-word}.sidebar nav{display:grid;gap:.35rem}.sidebar a{display:block;color:var(--text);padding:.45rem .6rem;border-radius:8px}.sidebar a:hover{background:var(--panel2)}",
         ".main{min-width:0;padding:1.5rem 2rem 4rem}.hero{background:linear-gradient(135deg,rgba(56,189,248,.14),rgba(239,68,68,.10));border:1px solid var(--border);border-radius:18px;padding:1.25rem;margin-bottom:1rem}.hero h2{margin:0 0 .4rem;font-size:1.6rem}.hero p{margin:0;color:var(--muted)}",
-        ".search-box{width:100%;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:10px;padding:.75rem .85rem;margin:1rem 0;font-size:.95rem}",
         "details.section{background:var(--panel);border:1px solid var(--border);border-radius:14px;margin:0 0 1rem;overflow:hidden}details.section>summary{cursor:pointer;font-weight:700;font-size:1.05rem;padding:.95rem 1.1rem;background:rgba(31,41,55,.8);display:flex;align-items:center;justify-content:space-between;gap:.9rem}.summary-title{min-width:0}.summary-meta{display:flex;align-items:center;justify-content:flex-end;gap:.25rem;flex-wrap:wrap}.section-body{padding:1rem}",
         ".metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:.8rem}.metric-card,.panel,.finding-card,.mini-card{background:rgba(31,41,55,.72);border:1px solid var(--border);border-radius:12px;padding:.85rem}.metric-label{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;margin-bottom:.25rem}.metric-value{font-weight:650;word-break:break-word}",
         ".two-col{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:.8rem;margin-top:.8rem}.finding-grid,.mini-grid{display:grid;gap:.85rem}.finding-card h3,.mini-card h3,.panel h3{margin:.55rem 0}.finding-head{display:flex;justify-content:space-between;gap:.6rem;align-items:center;flex-wrap:wrap}",
@@ -5173,17 +5172,11 @@ def format_html(summary, text_content=None):
         ".badge{display:inline-block;border-radius:999px;padding:.15rem .5rem;font-size:.76rem;font-weight:700;border:1px solid rgba(255,255,255,.14);margin:.08rem .1rem .08rem 0;white-space:nowrap}.status-badge{display:inline-block;border-radius:999px;padding:.16rem .48rem;font-size:.72rem;font-weight:700;border:1px solid rgba(255,255,255,.12);white-space:nowrap;background:rgba(148,163,184,.12);color:#cbd5e1}.status-empty{color:var(--muted);background:rgba(148,163,184,.08)}.status-content{color:#bae6fd;background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.28)}.status-warning,.status-medium{color:#fde68a;background:rgba(245,158,11,.14);border-color:rgba(245,158,11,.35)}.status-high{color:#fecaca;background:rgba(239,68,68,.16);border-color:rgba(239,68,68,.42)}.status-low{color:#bfdbfe;background:rgba(59,130,246,.14);border-color:rgba(59,130,246,.34)}.status-info{color:#ddd6fe;background:rgba(139,92,246,.14);border-color:rgba(139,92,246,.34)}.muted{color:var(--muted)}",
         ".severity-high,.priority-high{background:rgba(239,68,68,.18);color:#fecaca;border-color:rgba(239,68,68,.5)}.severity-medium,.priority-medium{background:rgba(245,158,11,.18);color:#fde68a;border-color:rgba(245,158,11,.5)}.severity-low,.priority-low{background:rgba(59,130,246,.18);color:#bfdbfe;border-color:rgba(59,130,246,.5)}.severity-info,.priority-info{color:var(--muted)}",
         ".confidence-high{background:rgba(34,197,94,.16);color:#bbf7d0}.confidence-medium{background:rgba(245,158,11,.16);color:#fde68a}.confidence-low{background:rgba(156,163,175,.16);color:#e5e7eb}.flag-execute-write,.flag-resource-executable,.flag-text-writable,.flag-raw-outside-file{background:rgba(239,68,68,.18);color:#fecaca}.flag-high-entropy,.flag-suspicious-name,.flag-unusual-name,.flag-virtual-only,.flag-large-virtual-size{background:rgba(245,158,11,.18);color:#fde68a}",
-        ".table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;margin:.5rem 0 1rem}th,td{border-bottom:1px solid var(--border);padding:.55rem;text-align:left;vertical-align:top}th{color:#cbd5e1;background:rgba(2,6,23,.45)}table.kv th{width:230px;color:var(--muted)}.evidence-list,.steps,.mini-card ul{padding-left:1.25rem}.recommendation{color:#bbf7d0}.context-note{color:#fde68a}.wrap-list{line-height:1.85}.hidden-by-search{display:none!important}",
+        ".table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;margin:.5rem 0 1rem}th,td{border-bottom:1px solid var(--border);padding:.55rem;text-align:left;vertical-align:top}th{color:#cbd5e1;background:rgba(2,6,23,.45)}table.kv th{width:230px;color:var(--muted)}.evidence-list,.steps,.mini-card ul{padding-left:1.25rem}.recommendation{color:#bbf7d0}.context-note{color:#fde68a}.wrap-list{line-height:1.85}",
         ".mono-list{margin:.65rem 0 1rem 0;padding:0;list-style:none;display:grid;gap:.35rem}.mono-list li{font-family:Consolas,'Cascadia Mono','Liberation Mono',Menlo,monospace;font-size:.82rem;line-height:1.45;background:rgba(2,6,23,.55);border:1px solid var(--border);border-radius:8px;padding:.45rem .6rem;overflow-wrap:anywhere;word-break:break-word}.mono-list-numbered{counter-reset:item}.mono-list-numbered li::before{counter-increment:item;content:counter(item) '. ';color:var(--muted);font-weight:700;margin-right:.35rem}",
         "@media(max-width:900px){.layout{grid-template-columns:1fr}.sidebar{position:static;height:auto}.main{padding:1rem}details.section>summary{align-items:flex-start;flex-direction:column}.summary-meta{justify-content:flex-start}}",
     ])
-    js = "".join([
-        "const s=document.getElementById('globalSearch');",
-        "s?.addEventListener('input',()=>{const q=s.value.trim().toLowerCase();",
-        "document.querySelectorAll('.searchable,.searchable-table tbody tr').forEach(e=>{",
-        "if(!q){e.classList.remove('hidden-by-search');return}",
-        "e.classList.toggle('hidden-by-search',!e.innerText.toLowerCase().includes(q));});});",
-    ])
+    js = ""
 
     return (
         '<!doctype html><html lang="en"><head>'
@@ -5196,8 +5189,8 @@ def format_html(summary, text_content=None):
         '</aside><main class="main"><section class="hero">'
         f'<h2>{html_escape(title)}</h2>'
         '<p>Static HTML report generated from the structured summary data. Malware strings are rendered as text/code, not as clickable links.</p>'
-        '</section><input id="globalSearch" class="search-box" type="search" placeholder="Filter visible findings, tables, imports, strings, and resources...">'
-        + "".join(sections) + f'<script>{js}</script></main></div></body></html>'
+        '</section>'
+        + "".join(sections) + '</main></div></body></html>'
     )
 
 ANSI_COLORS = {
