@@ -23,6 +23,8 @@ import ipaddress
 import json
 import math
 import os
+import time
+import threading
 import re
 import sys
 from datetime import datetime, timezone
@@ -720,6 +722,72 @@ def module_run(name, func, default, warnings):
         warnings.append(f"{name} failed: {type(e).__name__}: {e}")
         return default
 
+class DelayedProgress:
+    def __init__(self, total, label="Working", delay=1.5, enabled=True):
+        self.total = max(total, 1)
+        self.label = label
+        self.delay = delay
+        self.enabled = enabled and sys.stderr.isatty()
+        self.start_time = time.monotonic()
+        self.current = 0
+        self.message = ""
+        self.visible = False
+        self.last_line = ""
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.spinner_index = 0
+        self.spinner = "|/-\\"
+        self.thread = None
+
+    def start(self):
+        if not self.enabled:
+            return
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def update(self, message):
+        with self.lock:
+            self.current = min(self.current + 1, self.total)
+            self.message = message
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            elapsed = time.monotonic() - self.start_time
+
+            if elapsed >= self.delay:
+                self.visible = True
+                self._render()
+
+            time.sleep(0.15)
+
+    def _render(self):
+        with self.lock:
+            width = 24
+            ratio = min(self.current / self.total, 1.0)
+            filled = int(width * ratio)
+            bar = "#" * filled + "-" * (width - filled)
+            percent = int(ratio * 100)
+            spinner_char = self.spinner[self.spinner_index % len(self.spinner)]
+            self.spinner_index += 1
+            message = self.message or "Working..."
+
+        line = f"\r{self.label} [{bar}] {percent:3d}% {spinner_char} {message}"
+        padding = " " * max(0, len(self.last_line) - len(line))
+
+        sys.stderr.write(line + padding)
+        sys.stderr.flush()
+        self.last_line = line
+
+    def done(self):
+        if self.thread:
+            self.stop_event.set()
+            self.thread.join(timeout=0.5)
+
+        if self.visible:
+            self._render()
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 def dedupe_keep_order(items):
     seen = set()
@@ -5223,16 +5291,8 @@ def main():
     parser.add_argument("--html-output", metavar="PATH", help="HTML report path (default: <sample>_pe_report.html)")
     parser.add_argument("-p", "--print", dest="print_text", action="store_true", help="print text report to console")
     parser.add_argument("--no-color", action="store_true", help="disable colored console output")
+    parser.add_argument("--no-progress", action="store_true", help="disable delayed progress indicator")
     args = parser.parse_args()
-
-    try:
-        summary = summarize(args.path)
-    except pefile.PEFormatError as e:
-        print(f"Not a valid PE file: {e}", file=sys.stderr)
-        sys.exit(1)
-    except FileNotFoundError:
-        print("File not found", file=sys.stderr)
-        sys.exit(1)
 
     if args.json_output and not args.json:
         args.json = True
@@ -5241,29 +5301,69 @@ def main():
     json_output_path = args.json_output or default_json_output_path(args.path)
     html_output_path = args.html_output or default_html_output_path(args.path)
 
-    text_content = format_text(summary)
-    html_content = format_html(summary, text_content=text_content)
-
-    with open(text_output_path, "w", encoding="utf-8") as f:
-        f.write(text_content)
-
-    if not args.no_html:
-        html_content = format_html(summary, text_content=text_content)
-
-        with open(html_output_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-            print(f"Wrote HTML report to: {html_output_path}", file=sys.stderr)
-
+    progress_total = 5
+    if args.no_html:
+        progress_total -= 1
     if args.json:
-        json_content = json.dumps(summary, indent=2)
+        progress_total += 1
 
-        with open(json_output_path, "w", encoding="utf-8") as f:
-            f.write(json_content)
+    progress = DelayedProgress(
+        total=progress_total,
+        label=f"Analyzing {os.path.basename(args.path)}",
+        delay=1.5,
+        enabled=not args.no_progress
+    )
+    progress.start()
+
+    try:
+        progress.update("Building PE summary...")
+
+        try:
+            summary = summarize(args.path)
+        except pefile.PEFormatError as e:
+            print(f"Not a valid PE file: {e}", file=sys.stderr)
+            sys.exit(1)
+        except FileNotFoundError:
+            print("File not found", file=sys.stderr)
+            sys.exit(1)
+
+        progress.update("Formatting text report...")
+        text_content = format_text(summary)
+
+        html_content = None
+
+        if not args.no_html:
+            progress.update("Formatting HTML report...")
+            html_content = format_html(summary, text_content=text_content)
+
+        progress.update("Writing text report...")
+
+        with open(text_output_path, "w", encoding="utf-8") as f:
+            f.write(text_content)
+
+        if not args.no_html:
+            progress.update("Writing HTML report...")
+
+            with open(html_output_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+
+        if args.json:
+            progress.update("Writing JSON report...")
+            json_content = json.dumps(summary, indent=2)
+
+            with open(json_output_path, "w", encoding="utf-8") as f:
+                f.write(json_content)
+
+    finally:
+        progress.done()
 
     if args.print_text:
         print_text_report(text_content, use_color=not args.no_color)
 
     print(f"Wrote text report to: {text_output_path}", file=sys.stderr)
+
+    if not args.no_html:
+        print(f"Wrote HTML report to: {html_output_path}", file=sys.stderr)
 
     if args.json:
         print(f"Wrote detailed JSON report to: {json_output_path}", file=sys.stderr)
