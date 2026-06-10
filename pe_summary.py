@@ -5,13 +5,20 @@
 # Usage:
 #   python pe_summary.py sample.exe
 #   python pe_summary.py sample.exe -o report.txt
+#   python pe_summary.py sample.exe --html-output report.html
 #   python pe_summary.py sample.exe --json
 #   python pe_summary.py sample.exe --json --json-output details.json
 #   python pe_summary.py sample.exe --print
+#   python pe_summary.py sample.exe --no-html
+#
+# Default output:
+#   <sample>_pe_summary.txt
+#   <sample>_pe_report.html
 
 import argparse
 import base64
 import hashlib
+import html
 import ipaddress
 import json
 import math
@@ -4090,6 +4097,988 @@ def default_json_output_path(input_path):
 
     return f"{stem}_pe_details.json"
 
+
+def default_html_output_path(input_path):
+    base = os.path.basename(input_path)
+    stem = os.path.splitext(base)[0]
+
+    return f"{stem}_pe_report.html"
+
+
+def html_escape(value):
+    if value is None:
+        return ""
+
+    return html.escape(str(value), quote=True)
+
+
+def html_id(value):
+    value = str(value or "section").lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value).strip("-")
+
+    return value or "section"
+
+
+def html_scalar(value):
+    if value is None:
+        return "-"
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+
+    if isinstance(value, (list, tuple, set)):
+        if not value:
+            return "-"
+
+        return ", ".join(str(item) for item in value)
+
+    if isinstance(value, dict):
+        if not value:
+            return "-"
+
+        return json.dumps(value, sort_keys=True)
+
+    return str(value)
+
+
+def html_badge(value, kind="generic"):
+    if value is None or value == "":
+        return '<span class="badge muted">-</span>'
+
+    text = str(value)
+    css_value = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "value"
+    classes = f"badge {kind} {kind}-{css_value}"
+
+    return f'<span class="{html_escape(classes)}">{html_escape(text)}</span>'
+
+
+def html_severity_badges(severity, confidence=None):
+    result = html_badge(str(severity or "info").upper(), "severity")
+
+    if confidence:
+        result += " " + html_badge(confidence, "confidence")
+
+    return result
+
+
+def html_flags(flags):
+    if not flags:
+        return '<span class="muted">-</span>'
+
+    return " ".join(html_badge(flag, "flag") for flag in flags)
+
+
+def html_kv(rows):
+    body = []
+
+    for key, value in rows:
+        body.append(
+            "<tr>"
+            f"<th>{html_escape(key)}</th>"
+            f"<td>{html_escape(html_scalar(value))}</td>"
+            "</tr>"
+        )
+
+    return '<table class="kv"><tbody>' + "".join(body) + "</tbody></table>"
+
+
+def html_table(headers, rows):
+    if not rows:
+        return '<p class="muted">None</p>'
+
+    head = "".join(f"<th>{html_escape(header)}</th>" for header in headers)
+    body = []
+
+    for row in rows:
+        body.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
+
+    return (
+        '<div class="table-wrap"><table class="data-table searchable-table">'
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body)}</tbody>"
+        "</table></div>"
+    )
+
+
+def html_status_badge(label, value=None, state="content"):
+    text = str(label) if value is None else f"{label}: {value}"
+    state_value = re.sub(r"[^a-z0-9]+", "-", str(state).lower()).strip("-") or "content"
+
+    return f'<span class="status-badge status-{html_escape(state_value)}">{html_escape(text)}</span>'
+
+
+def pluralize(count, singular, plural=None):
+    if plural is None:
+        plural = singular + "s"
+
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def html_section(title, content, open_by_default=True, section_id=None, meta=None):
+    section_id = html_id(section_id or title)
+    open_attr = " open" if open_by_default else ""
+    meta_html = ""
+
+    if meta:
+        if isinstance(meta, (list, tuple)):
+            meta_html = "".join(str(item) for item in meta if item)
+        else:
+            meta_html = str(meta)
+
+    if meta_html:
+        summary = (
+            '<summary>'
+            f'<span class="summary-title">{html_escape(title)}</span>'
+            f'<span class="summary-meta">{meta_html}</span>'
+            '</summary>'
+        )
+    else:
+        summary = f'<summary><span class="summary-title">{html_escape(title)}</span></summary>'
+
+    return (
+        f'<details class="section" id="{section_id}"{open_attr}>'
+        f'{summary}'
+        f'<div class="section-body">{content}</div>'
+        '</details>'
+    )
+
+
+def html_nav(title):
+    return f'<a href="#{html_id(title)}">{html_escape(title)}</a>'
+
+
+def count_non_noise_strings(strings, key):
+    return sum(
+        1 for item in strings.get(key, [])
+        if item.get("confidence") != "noise"
+    )
+
+
+def html_section_meta(summary, title, visible_limit=None):
+    findings = summary.get("findings", [])
+    severity_counts = {
+        "high": sum(1 for item in findings if item.get("severity") == "high"),
+        "medium": sum(1 for item in findings if item.get("severity") == "medium"),
+        "low": sum(1 for item in findings if item.get("severity") == "low"),
+        "info": sum(1 for item in findings if item.get("severity") == "info"),
+    }
+
+    if title == "Overview":
+        return [html_status_badge("dashboard", state="content")]
+
+    if title == "Metadata and headers":
+        warning_count = len(summary.get("parser_warnings", []))
+        badges = [html_status_badge("identity", state="content"), html_status_badge("headers", state="content")]
+
+        if summary.get("version_info"):
+            badges.append(html_status_badge("version", state="content"))
+
+        if summary.get("debug"):
+            badges.append(html_status_badge("debug", len(summary.get("debug", [])), state="content"))
+
+        if warning_count:
+            badges.append(html_status_badge("warnings", warning_count, state="warning"))
+
+        return badges
+
+    if title == "Top findings":
+        shown = min(visible_limit or 5, len(findings))
+
+        if not findings:
+            return [html_status_badge("empty", state="empty")]
+
+        badges = [html_status_badge("shown", f"{shown}/{len(findings)}", state="content")]
+
+        if severity_counts["high"]:
+            badges.append(html_status_badge("high", severity_counts["high"], state="high"))
+
+        if severity_counts["medium"]:
+            badges.append(html_status_badge("medium", severity_counts["medium"], state="medium"))
+
+        return badges
+
+    if title == "All findings":
+        if not findings:
+            return [html_status_badge("empty", state="empty")]
+
+        badges = [html_status_badge("total", len(findings), state="content")]
+
+        for severity in ["high", "medium", "low", "info"]:
+            if severity_counts[severity]:
+                badges.append(html_status_badge(severity, severity_counts[severity], state=severity))
+
+        return badges
+
+    if title == "Recommended next steps":
+        count = len(summary.get("recommended_next_steps", []))
+        return [html_status_badge(pluralize(count, "step"), state="content" if count else "empty")]
+
+    if title == "Key artifacts":
+        count = len(summary.get("key_artifacts", []))
+        return [html_status_badge(pluralize(count, "artifact"), state="content" if count else "empty")]
+
+    if title == "Runtime context":
+        runtime = summary.get("runtime_context", {})
+
+        if not runtime.get("detected"):
+            return [html_status_badge("not detected", state="empty")]
+
+        family_count = len(runtime.get("families", []))
+        badges = [html_status_badge("detected", state="content")]
+        badges.append(html_status_badge(pluralize(family_count, "family", "families"), state="content"))
+
+        if runtime.get("is_runtime_heavy"):
+            badges.append(html_status_badge("runtime-heavy", state="warning"))
+
+        return badges
+
+    if title == "Imports":
+        imports = summary.get("imports", {})
+        import_count = imports.get("import_count", 0) or 0
+        dll_count = imports.get("dll_count", 0) or 0
+        combo_count = len(imports.get("api_combination_findings", []))
+        badges = [html_status_badge("DLLs", dll_count, state="content" if dll_count else "empty")]
+        badges.append(html_status_badge("imports", import_count, state="content" if import_count else "empty"))
+
+        if combo_count:
+            badges.append(html_status_badge("API combos", combo_count, state="warning"))
+
+        return badges
+
+    if title == "Sections":
+        sections = summary.get("sections", [])
+        flagged = sum(1 for section in sections if section.get("flags"))
+        high_entropy = sum(1 for section in sections if "HIGH_ENTROPY" in section.get("flags", []))
+        badges = [html_status_badge(pluralize(len(sections), "section"), state="content" if sections else "empty")]
+
+        if flagged:
+            badges.append(html_status_badge("flagged", flagged, state="warning"))
+
+        if high_entropy:
+            badges.append(html_status_badge("high entropy", high_entropy, state="warning"))
+
+        return badges
+
+    if title == "Resources":
+        resources = summary.get("resources") or {}
+        resource_count = resources.get("resource_count", 0) or 0
+        interesting_count = len(resources.get("interesting_resources", []))
+        badges = [html_status_badge(pluralize(resource_count, "resource"), state="content" if resource_count else "empty")]
+
+        if interesting_count:
+            badges.append(html_status_badge("interesting", interesting_count, state="warning"))
+
+        return badges
+
+    if title == "Overlay / TLS / certificate / .NET":
+        overlay = summary.get("overlay")
+        tls = summary.get("tls")
+        certificate = summary.get("certificate") or {}
+        dotnet = summary.get("dotnet") or {}
+        badges = []
+        badges.append(html_status_badge("overlay", "present" if overlay else "none", state="warning" if overlay else "empty"))
+        badges.append(html_status_badge("TLS", "present" if tls else "none", state="warning" if tls else "empty"))
+        badges.append(html_status_badge("cert", "present" if certificate.get("present") else "none", state="content" if certificate.get("present") else "empty"))
+        badges.append(html_status_badge(".NET", "yes" if dotnet.get("is_dotnet") else "no", state="content" if dotnet.get("is_dotnet") else "empty"))
+
+        return badges
+
+    if title == "Interesting strings":
+        strings = summary.get("strings", {})
+        candidate_count = sum(
+            count_non_noise_strings(strings, key)
+            for key in ["urls", "ipv4", "domains", "emails", "registry_paths", "windows_paths", "unc_paths", "named_pipes", "pdb_paths"]
+        )
+        badges = [html_status_badge("candidates", candidate_count, state="content" if candidate_count else "empty")]
+        url_count = count_non_noise_strings(strings, "urls")
+        domain_count = count_non_noise_strings(strings, "domains")
+        ip_count = count_non_noise_strings(strings, "ipv4")
+
+        if url_count:
+            badges.append(html_status_badge("URLs", url_count, state="warning"))
+
+        if domain_count:
+            badges.append(html_status_badge("domains", domain_count, state="warning"))
+
+        if ip_count:
+            badges.append(html_status_badge("IPv4", ip_count, state="warning"))
+
+        return badges
+
+    if title == "Decoded blobs":
+        blobs = summary.get("strings", {}).get("encoded_blobs", [])
+        interesting = sum(1 for blob in blobs if (blob.get("assessment") or {}).get("interesting"))
+        badges = [html_status_badge(pluralize(len(blobs), "candidate"), state="content" if blobs else "empty")]
+
+        if interesting:
+            badges.append(html_status_badge("interesting", interesting, state="warning"))
+
+        return badges
+
+    if title == "Raw text report":
+        return [html_status_badge("plain text", state="content")]
+
+    if title == "Raw JSON":
+        return [html_status_badge("full structured data", state="content")]
+
+    return []
+
+
+def html_best_finding(summary):
+    findings = summary.get("findings", [])
+
+    if not findings:
+        return None
+
+    return sorted(findings, key=finding_sort_key)[0]
+
+
+def html_overview(summary):
+    file_info = summary.get("file", {})
+    hashes = summary.get("hashes", {})
+    file_header = summary.get("file_header", {})
+    optional = summary.get("optional_header", {})
+    entry_point = summary.get("entry_point", {})
+    imports = summary.get("imports", {})
+    resources = summary.get("resources") or {}
+    overlay = summary.get("overlay") or {}
+    runtime = summary.get("runtime_context", {})
+    finding = html_best_finding(summary)
+    ep_text = entry_point.get("entry_point_rva", "-")
+
+    if entry_point.get("section"):
+        ep_text += f" in {entry_point.get('section')}"
+
+    if entry_point.get("section_entropy") is not None:
+        ep_text += f" / entropy {entry_point.get('section_entropy')}"
+
+    runtime_text = "not detected"
+
+    if runtime.get("detected"):
+        runtime_text = ", ".join(
+            family.get("name", "runtime")
+            for family in runtime.get("families", [])[:4]
+        )
+
+        if runtime.get("is_runtime_heavy"):
+            runtime_text += " / runtime-heavy"
+
+    highest_html = '<span class="muted">No structured findings</span>'
+
+    if finding:
+        highest_html = (
+            html_severity_badges(finding.get("severity"), finding.get("confidence"))
+            + f' <span>{html_escape(finding.get("title"))}</span>'
+        )
+
+    cards = [
+        ("File", html_escape(file_info.get("name"))),
+        ("Size", html_escape(f"{file_info.get('size_bytes')} bytes" if file_info.get("size_bytes") is not None else "-")),
+        ("SHA256", f"<code>{html_escape(hashes.get('sha256'))}</code>"),
+        ("Highest finding", highest_html),
+        ("Machine", html_escape(file_header.get("machine"))),
+        ("Subsystem", html_escape(optional.get("subsystem"))),
+        ("Compile timestamp", html_escape(file_header.get("timestamp_utc"))),
+        ("Entry point", html_escape(ep_text)),
+        ("Imports", html_escape(f"{imports.get('dll_count', 0)} DLLs / {imports.get('import_count', 0)} imports")),
+        ("Resources", html_escape(f"{resources.get('resource_count', 0)} entries" if resources else "not present")),
+        ("Overlay", html_escape(f"{overlay.get('classification')} / {overlay.get('size')} bytes" if overlay else "not present")),
+        ("Runtime", html_escape(runtime_text)),
+    ]
+    card_html = "".join(
+        '<div class="metric-card">'
+        f'<div class="metric-label">{html_escape(label)}</div>'
+        f'<div class="metric-value">{value}</div>'
+        '</div>'
+        for label, value in cards
+    )
+    verdict_items = "".join(
+        f"<li>{html_escape(item)}</li>"
+        for item in summary.get("triage_verdict", {}).get("summary", [])
+    )
+    inspect_items = "".join(
+        f"<li>{html_escape(item)}</li>"
+        for item in summary.get("what_to_inspect_first", [])
+    )
+
+    return (
+        '<div class="metrics-grid">' + card_html + '</div>'
+        '<div class="two-col">'
+        '<div class="panel"><h3>Triage verdict</h3><ul>' + verdict_items + '</ul></div>'
+        '<div class="panel"><h3>What to inspect first</h3><ol>' + inspect_items + '</ol></div>'
+        '</div>'
+    )
+
+
+def html_findings(summary, limit=None):
+    findings = sorted(summary.get("findings", []), key=finding_sort_key)
+
+    if limit:
+        findings = findings[:limit]
+
+    if not findings:
+        return '<p class="muted">No structured findings generated.</p>'
+
+    cards = []
+
+    for finding in findings:
+        evidence = "".join(
+            f"<li><code>{html_escape(preview(item, 240))}</code></li>"
+            for item in finding.get("evidence", [])[:10]
+        )
+        recommendation = ""
+
+        if finding.get("recommendation"):
+            recommendation = f'<p class="recommendation"><strong>Next:</strong> {html_escape(finding.get("recommendation"))}</p>'
+
+        context = ""
+
+        if finding.get("context_adjusted"):
+            context = (
+                '<p class="context-note">Context-adjusted because runtime-heavy context was detected. '
+                f'Original: {html_escape(finding.get("original_severity"))}/{html_escape(finding.get("original_confidence"))}.</p>'
+            )
+
+        cards.append(
+            f'<article class="finding-card severity-border-{html_escape(str(finding.get("severity", "info")).lower())} searchable">'
+            '<div class="finding-head">'
+            f'<div>{html_severity_badges(finding.get("severity"), finding.get("confidence"))}</div>'
+            f'<code>{html_escape(finding.get("id"))}</code>'
+            '</div>'
+            f'<h3>{html_escape(finding.get("title"))}</h3>'
+            + (f'<ul class="evidence-list">{evidence}</ul>' if evidence else '<p class="muted">No evidence listed.</p>')
+            + recommendation
+            + context
+            + '</article>'
+        )
+
+    return '<div class="finding-grid">' + "".join(cards) + '</div>'
+
+
+def html_next_steps(summary):
+    steps = summary.get("recommended_next_steps", [])
+
+    if not steps:
+        return '<p class="muted">No next steps generated.</p>'
+
+    return '<ol class="steps">' + "".join(f"<li>{html_escape(step)}</li>" for step in steps) + '</ol>'
+
+
+def html_key_artifacts(summary):
+    rows = []
+
+    for artifact in summary.get("key_artifacts", [])[:200]:
+        rows.append([
+            html_badge(artifact.get("type"), "artifact"),
+            f"<code>{html_escape(artifact.get('name'))}</code>",
+            f"<code>{html_escape(preview(artifact.get('value'), 240))}</code>",
+            html_escape(artifact.get("origin")),
+            f"<code>{html_escape(artifact.get('offset'))}</code>",
+        ])
+
+    return html_table(["Type", "Name", "Value", "Origin", "Offset"], rows)
+
+
+def html_runtime(summary):
+    runtime = summary.get("runtime_context", {})
+
+    if not runtime.get("detected"):
+        return '<p class="muted">No bundled-runtime context detected.</p>'
+
+    parts = [html_kv([
+        ("Detected", runtime.get("detected")),
+        ("Runtime-heavy", runtime.get("is_runtime_heavy")),
+        ("Large runtime shape", runtime.get("large_runtime_shape")),
+    ])]
+    cards = []
+
+    for family in runtime.get("families", []):
+        evidence = "".join(
+            f"<li><code>{html_escape(preview(item, 220))}</code></li>"
+            for item in family.get("evidence", [])[:12]
+        )
+        cards.append(
+            '<article class="mini-card searchable">'
+            f'<h3>{html_escape(family.get("name"))} {html_badge(family.get("confidence"), "confidence")}</h3>'
+            f'<ul>{evidence}</ul>'
+            '</article>'
+        )
+
+    if cards:
+        parts.append('<div class="mini-grid">' + "".join(cards) + '</div>')
+
+    if runtime.get("notes"):
+        parts.append('<ul>' + "".join(f"<li>{html_escape(note)}</li>" for note in runtime.get("notes", [])) + '</ul>')
+
+    return "".join(parts)
+
+
+def html_strings(summary):
+    strings = summary.get("strings", {})
+    stats = strings.get("stats", {})
+    parts = [html_kv([
+        ("ASCII string count", stats.get("ascii_string_count")),
+        ("UTF-16LE string count", stats.get("utf16le_string_count")),
+        ("Unique combined string count", stats.get("unique_combined_string_count")),
+        ("Longest string length", stats.get("longest_string_length")),
+        ("Base64-like total count", stats.get("base64_like_total_count")),
+        ("Hex-like total count", stats.get("hex_like_total_count")),
+    ])]
+
+    for label, key in [
+        ("URLs", "urls"),
+        ("IPv4 addresses", "ipv4"),
+        ("Domains", "domains"),
+        ("Emails", "emails"),
+        ("Registry paths", "registry_paths"),
+        ("Windows paths", "windows_paths"),
+        ("UNC paths", "unc_paths"),
+        ("Named pipes", "named_pipes"),
+        ("PDB paths", "pdb_paths"),
+    ]:
+        rows = []
+
+        for item in sorted(strings.get(key, []), key=string_item_sort_key)[:160]:
+            context = item.get("context") or item.get("ip_type") or item.get("url_type") or item.get("noise_reason") or item.get("parse_reason")
+            rows.append([
+                f"<code>{html_escape(preview(item.get('value'), 260))}</code>",
+                html_badge(item.get("confidence"), "confidence"),
+                f"<code>{html_escape(item.get('offset'))}</code>",
+                html_escape(item.get("origin")),
+                html_escape(item.get("encoding")),
+                html_escape(context),
+            ])
+
+        parts.append(html_section(
+            label,
+            html_table(["Value", "Confidence", "Offset", "Origin", "Encoding", "Context"], rows),
+            open_by_default=key in {"urls", "ipv4", "domains"},
+            section_id=f"strings-{key}"
+        ))
+
+    if strings.get("keyword_hits"):
+        cards = []
+
+        for category, values in strings.get("keyword_hits", {}).items():
+            items = "".join(
+                f"<li><code>{html_escape(preview(item.get('value'), 220))}</code> "
+                f"<span class='muted'>{html_escape(item.get('offset'))} / {html_escape(item.get('origin'))}</span></li>"
+                for item in values[:100]
+            ) or '<li class="muted">None</li>'
+            cards.append(
+                '<article class="mini-card searchable">'
+                f'<h3>{html_escape(category)}</h3><ul>{items}</ul>'
+                '</article>'
+            )
+
+        parts.append(html_section("Keyword hits", '<div class="mini-grid">' + "".join(cards) + '</div>', open_by_default=False))
+
+    return "".join(parts)
+
+
+def html_encoded_blobs(summary):
+    blobs = sorted(summary.get("strings", {}).get("encoded_blobs", []), key=encoded_blob_sort_key)
+
+    if not blobs:
+        return '<p class="muted">No decodable base64/hex blob candidates with useful decoded content found.</p>'
+
+    cards = []
+
+    for blob in blobs[:100]:
+        assessment = blob.get("assessment", {}) or {}
+        reasons = "; ".join(assessment.get("reasons", [])[:6])
+        sample_strings = "".join(
+            f"<li><code>{html_escape(preview(item, 220))}</code></li>"
+            for item in blob.get("sample_strings", [])[:8]
+        )
+        indicators = []
+
+        for label, key in [("URLs", "urls"), ("Domains", "domains"), ("IPv4", "ipv4")]:
+            if blob.get(key):
+                values = ", ".join(str(item) for item in blob.get(key, [])[:12])
+                indicators.append(f"<p><strong>{html_escape(label)}:</strong> <code>{html_escape(values)}</code></p>")
+
+        cards.append(
+            '<article class="mini-card searchable">'
+            '<div class="finding-head">'
+            f'{html_badge(blob.get("type"), "artifact")} {html_badge(assessment.get("confidence"), "confidence")}'
+            f'<code>{html_escape(blob.get("source_offset"))}</code>'
+            '</div>'
+            f'<h3>{html_escape(assessment.get("content_type") or "decoded blob")}</h3>'
+            + html_kv([
+                ("Source origin", blob.get("source_origin")),
+                ("Decoded size", blob.get("decoded_size")),
+                ("Decoded entropy", blob.get("decoded_entropy")),
+                ("Magic", blob.get("magic_hint")),
+                ("Decoded SHA256", blob.get("decoded_sha256")),
+                ("Interesting", assessment.get("interesting")),
+                ("Triage interesting", assessment.get("triage_interesting")),
+                ("Suspicious", assessment.get("suspicious")),
+                ("Reason", reasons),
+            ])
+            + "".join(indicators)
+            + (f'<h4>Sample decoded strings</h4><ul>{sample_strings}</ul>' if sample_strings else "")
+            + '</article>'
+        )
+
+    return '<div class="mini-grid">' + "".join(cards) + '</div>'
+
+
+def html_imports(summary):
+    imports = summary.get("imports", {})
+    parts = [html_kv([
+        ("Import table present", imports.get("import_table_present")),
+        ("DLL count", imports.get("dll_count")),
+        ("Import count", imports.get("import_count")),
+        ("Ordinal-only import count", imports.get("ordinal_only_import_count")),
+    ])]
+
+    if imports.get("api_combination_findings"):
+        parts.append('<h3>API combination findings</h3>')
+        parts.append(html_findings({"findings": imports.get("api_combination_findings", [])}))
+
+    if imports.get("capability_imports"):
+        cards = []
+
+        for category, values in imports.get("capability_imports", {}).items():
+            items = "".join(f"<li><code>{html_escape(value)}</code></li>" for value in values[:80])
+            cards.append(
+                '<article class="mini-card searchable">'
+                f'<h3>{html_escape(category)}</h3><ul>{items}</ul>'
+                '</article>'
+            )
+
+        parts.append('<h3>Capability imports</h3><div class="mini-grid">' + "".join(cards) + '</div>')
+
+    if imports.get("dlls"):
+        dlls = " ".join(html_badge(dll, "dll") for dll in imports.get("dlls", []))
+        parts.append('<h3>Imported DLLs</h3><p class="wrap-list">' + dlls + '</p>')
+
+    return "".join(parts)
+
+
+def html_sections_table(summary):
+    rows = []
+
+    for section in summary.get("sections", []):
+        rows.append([
+            f"<code>{html_escape(section.get('name'))}</code>",
+            f"<code>{html_escape(section.get('virtual_address'))}</code>",
+            html_escape(section.get("virtual_size")),
+            f"<code>{html_escape(section.get('raw_pointer'))}</code>",
+            html_escape(section.get("raw_size")),
+            html_escape(section.get("entropy")),
+            html_flags(section.get("flags", [])),
+            f"<code>{html_escape(section.get('sha256'))}</code>",
+        ])
+
+    content = html_table(["Name", "VA", "Virtual size", "Raw ptr", "Raw size", "Entropy", "Flags", "SHA256"], rows)
+    anomalies = summary.get("section_layout_anomalies", [])
+
+    if anomalies:
+        anomaly_rows = []
+
+        for anomaly in anomalies:
+            anomaly_rows.append([
+                html_badge(anomaly.get("type"), "flag"),
+                html_escape(anomaly.get("section") or ", ".join(anomaly.get("sections", []))),
+                f"<code>{html_escape(anomaly.get('range') or anomaly.get('range_a'))}</code>",
+                f"<code>{html_escape(anomaly.get('range_b'))}</code>",
+            ])
+
+        content += '<h3>Section layout anomalies</h3>'
+        content += html_table(["Type", "Section(s)", "Range A", "Range B"], anomaly_rows)
+
+    return content
+
+
+def html_resources(summary):
+    resources = summary.get("resources")
+
+    if not resources:
+        return '<p class="muted">No resources found.</p>'
+
+    by_type_rows = []
+
+    for resource_type, info in sorted(resources.get("by_type", {}).items()):
+        by_type_rows.append([
+            html_badge(resource_type, "resource"),
+            html_escape(info.get("count")),
+            html_escape(info.get("max_size")),
+            html_escape(info.get("max_entropy")),
+            html_badge(info.get("highest_priority"), "priority"),
+        ])
+
+    content = '<h3>Resource type summary</h3>'
+    content += html_table(["Type", "Count", "Max size", "Max entropy", "Highest priority"], by_type_rows)
+
+    interesting_rows = []
+
+    for item in resources.get("interesting_resources", [])[:100]:
+        embedded = ", ".join(
+            f"{hit.get('magic')}@{hit.get('offset')}({hit.get('confidence')})"
+            for hit in item.get("embedded_magic_hits_compact", [])[:5]
+        )
+        reasons = "; ".join(item.get("priority_reasons", [])[:4])
+        interesting_rows.append([
+            f"<code>{html_escape(item.get('resource_path'))}</code>",
+            html_badge(item.get("priority"), "priority"),
+            html_escape(item.get("size")),
+            html_escape(item.get("entropy")),
+            html_escape(item.get("magic_hint")),
+            f"<code>{html_escape(item.get('file_offset'))}</code>",
+            html_escape(embedded),
+            html_escape(reasons),
+        ])
+
+    if interesting_rows:
+        content += '<h3>Interesting resources</h3>'
+        content += html_table(["Path", "Priority", "Size", "Entropy", "Magic", "Offset", "Embedded magic", "Reason"], interesting_rows)
+
+    return content
+
+
+def html_overlay_tls_certificate(summary):
+    overlay = summary.get("overlay")
+    tls = summary.get("tls")
+    certificate = summary.get("certificate") or {}
+    dotnet = summary.get("dotnet") or {}
+    parts = []
+
+    if overlay:
+        magic = ", ".join(
+            f"{hit.get('magic')}@{hit.get('offset')}({hit.get('confidence')})"
+            for hit in overlay.get("embedded_magic_hits", [])[:10]
+        )
+        parts.append('<h3>Overlay</h3>')
+        parts.append(html_kv([
+            ("Offset", overlay.get("offset")),
+            ("Size", overlay.get("size")),
+            ("Entropy", overlay.get("entropy")),
+            ("Magic hint", overlay.get("magic_hint")),
+            ("Classification", overlay.get("classification")),
+            ("SHA256", overlay.get("sha256")),
+            ("Embedded magic", magic),
+        ]))
+    else:
+        parts.append('<h3>Overlay</h3><p class="muted">No overlay found.</p>')
+
+    parts.append('<h3>Certificate</h3>')
+    parts.append(html_kv([
+        ("Present", certificate.get("present")),
+        ("File offset", certificate.get("file_offset")),
+        ("Size", certificate.get("size")),
+        ("Note", certificate.get("note")),
+    ]))
+
+    if tls:
+        callbacks = ", ".join(
+            f"{item.get('va')} / {item.get('section')}"
+            for item in tls.get("callbacks", [])
+        )
+        parts.append('<h3>TLS</h3>')
+        parts.append(html_kv([
+            ("Address of callbacks", tls.get("address_of_callbacks")),
+            ("Callback count", tls.get("callback_count")),
+            ("Callbacks", callbacks),
+            ("Characteristics", tls.get("characteristics")),
+        ]))
+    else:
+        parts.append('<h3>TLS</h3><p class="muted">No TLS directory found.</p>')
+
+    parts.append('<h3>.NET</h3>')
+    parts.append(html_kv([
+        ("Is .NET", dotnet.get("is_dotnet")),
+        ("CLR header RVA", dotnet.get("clr_header_rva")),
+        ("CLR header size", dotnet.get("clr_header_size")),
+    ]))
+
+    return "".join(parts)
+
+
+def html_metadata(summary):
+    file_info = summary.get("file", {})
+    hashes = summary.get("hashes", {})
+    dos = summary.get("dos_header", {})
+    file_header = summary.get("file_header", {})
+    optional = summary.get("optional_header", {})
+    version_info = summary.get("version_info", {})
+    rich = summary.get("rich_header")
+    debug = summary.get("debug", [])
+    directories = summary.get("data_directories", [])
+    delay_imports = summary.get("delay_imports")
+    exports = summary.get("exports")
+    parts = []
+
+    parts.append('<h3>File identity</h3>')
+    parts.append(html_kv([
+        ("File", file_info.get("name")),
+        ("Path", file_info.get("path")),
+        ("Size", file_info.get("size_bytes")),
+        ("MD5", hashes.get("md5")),
+        ("SHA1", hashes.get("sha1")),
+        ("SHA256", hashes.get("sha256")),
+        ("Imphash", hashes.get("imphash")),
+        ("Authentihash SHA256", hashes.get("authentihash_sha256")),
+    ]))
+
+    parts.append('<h3>Headers</h3>')
+    parts.append(html_kv([
+        ("DOS e_magic", dos.get("e_magic")),
+        ("DOS e_lfanew", dos.get("e_lfanew")),
+        ("Machine", f"{file_header.get('machine')} ({file_header.get('machine_raw')})"),
+        ("Sections", file_header.get("number_of_sections")),
+        ("Compile timestamp UTC", file_header.get("timestamp_utc")),
+        ("Compile timestamp raw", file_header.get("timestamp_raw")),
+        ("Timestamp notes", file_header.get("timestamp_notes")),
+        ("Characteristics", file_header.get("characteristics")),
+        ("PE magic", optional.get("magic")),
+        ("Linker version", optional.get("linker_version")),
+        ("Subsystem", optional.get("subsystem")),
+        ("Image base", optional.get("image_base")),
+        ("Size of image", optional.get("size_of_image")),
+        ("Size of headers", optional.get("size_of_headers")),
+        ("Section alignment", optional.get("section_alignment")),
+        ("File alignment", optional.get("file_alignment")),
+        ("DLL characteristics", optional.get("dll_characteristics")),
+    ]))
+
+    if version_info:
+        parts.append('<h3>Version info</h3>')
+        parts.append(html_kv(sorted(version_info.items())))
+
+    if rich:
+        parts.append('<h3>Rich header</h3>')
+        parts.append(html_kv(sorted(rich.items())))
+
+    if debug:
+        rows = []
+
+        for item in debug:
+            rows.append([
+                html_escape(item.get("type")),
+                html_escape(item.get("timestamp_utc")),
+                html_escape(item.get("size_of_data")),
+                f"<code>{html_escape(item.get('pdb_path'))}</code>",
+            ])
+
+        parts.append('<h3>Debug / PDB</h3>')
+        parts.append(html_table(["Type", "Timestamp UTC", "Size", "PDB path"], rows))
+
+    if directories:
+        rows = []
+
+        for directory in directories:
+            rows.append([
+                html_escape(directory.get("name")),
+                f"<code>{html_escape(directory.get('rva'))}</code>",
+                html_escape(directory.get("size")),
+            ])
+
+        parts.append('<h3>Data directories</h3>')
+        parts.append(html_table(["Name", "RVA", "Size"], rows))
+
+    if delay_imports:
+        parts.append('<h3>Delay imports</h3>')
+        parts.append(html_kv([
+            ("DLL count", delay_imports.get("dll_count")),
+            ("DLLs", delay_imports.get("dlls")),
+            ("Sample imports", delay_imports.get("sample_imports")),
+        ]))
+
+    if exports:
+        parts.append('<h3>Exports</h3>')
+        parts.append(html_kv([
+            ("DLL name", exports.get("dll_name")),
+            ("Export count", exports.get("export_count")),
+            ("Named export count", exports.get("named_export_count")),
+            ("Ordinal-only export count", exports.get("ordinal_only_export_count")),
+            ("Sample exports", exports.get("sample_exports")),
+        ]))
+
+    if summary.get("parser_warnings"):
+        parts.append('<h3>Parser warnings</h3>')
+        parts.append('<ul>' + "".join(f"<li>{html_escape(warning)}</li>" for warning in summary.get("parser_warnings", [])) + '</ul>')
+
+    return "".join(parts)
+
+
+def format_html(summary, text_content=None):
+    file_name = summary.get("file", {}).get("name", "PE report")
+    title = f"PE triage report - {file_name}"
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    json_text = json.dumps(summary, indent=2)
+    section_specs = [
+        ("Overview", html_overview(summary), True, None, None),
+        ("Metadata and headers", html_metadata(summary), True, None, None),
+        ("Top findings", html_findings(summary, limit=5), True, None, 5),
+        ("All findings", html_findings(summary), True, None, None),
+        ("Recommended next steps", html_next_steps(summary), True, None, None),
+        ("Key artifacts", html_key_artifacts(summary), True, None, None),
+        ("Runtime context", html_runtime(summary), True, None, None),
+        ("Imports", html_imports(summary), True, None, None),
+        ("Sections", html_sections_table(summary), True, None, None),
+        ("Resources", html_resources(summary), True, None, None),
+        ("Overlay / TLS / certificate / .NET", html_overlay_tls_certificate(summary), True, None, None),
+        ("Interesting strings", html_strings(summary), False, None, None),
+        ("Decoded blobs", html_encoded_blobs(summary), False, None, None),
+        ("Raw text report", f'<pre>{html_escape(text_content or "")}</pre>', False, None, None),
+        ("Raw JSON", f'<pre>{html_escape(json_text)}</pre>', False, None, None),
+    ]
+    nav_titles = [title for title, _content, _open, _section_id, _limit in section_specs]
+    sections = [
+        html_section(
+            title,
+            content,
+            open_by_default=open_by_default,
+            section_id=section_id,
+            meta=html_section_meta(summary, title, visible_limit=limit),
+        )
+        for title, content, open_by_default, section_id, limit in section_specs
+    ]
+    css = "".join([
+        ":root{--bg:#0f172a;--panel:#111827;--panel2:#1f2937;--text:#e5e7eb;--muted:#9ca3af;--border:#374151;--code:#020617;--high:#ef4444;--medium:#f59e0b;--low:#3b82f6;--accent:#38bdf8}",
+        "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.45}",
+        "a{color:var(--accent);text-decoration:none}code,pre{font-family:Consolas,'Cascadia Mono','Liberation Mono',Menlo,monospace}",
+        "pre{white-space:pre-wrap;word-break:break-word;background:var(--code);border:1px solid var(--border);border-radius:12px;padding:1rem;overflow:auto}",
+        "code{background:rgba(2,6,23,.8);border:1px solid rgba(55,65,81,.7);border-radius:6px;padding:.1rem .3rem;word-break:break-word}",
+        ".layout{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;overflow:auto;background:#020617;border-right:1px solid var(--border);padding:1.25rem}",
+        ".sidebar h1{font-size:1rem;margin:0 0 .35rem}.subtitle{color:var(--muted);font-size:.82rem;margin-bottom:1rem;word-break:break-word}.sidebar nav{display:grid;gap:.35rem}.sidebar a{display:block;color:var(--text);padding:.45rem .6rem;border-radius:8px}.sidebar a:hover{background:var(--panel2)}",
+        ".main{min-width:0;padding:1.5rem 2rem 4rem}.hero{background:linear-gradient(135deg,rgba(56,189,248,.14),rgba(239,68,68,.10));border:1px solid var(--border);border-radius:18px;padding:1.25rem;margin-bottom:1rem}.hero h2{margin:0 0 .4rem;font-size:1.6rem}.hero p{margin:0;color:var(--muted)}",
+        ".search-box{width:100%;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:10px;padding:.75rem .85rem;margin:1rem 0;font-size:.95rem}",
+        "details.section{background:var(--panel);border:1px solid var(--border);border-radius:14px;margin:0 0 1rem;overflow:hidden}details.section>summary{cursor:pointer;font-weight:700;font-size:1.05rem;padding:.95rem 1.1rem;background:rgba(31,41,55,.8);display:flex;align-items:center;justify-content:space-between;gap:.9rem}.summary-title{min-width:0}.summary-meta{display:flex;align-items:center;justify-content:flex-end;gap:.25rem;flex-wrap:wrap}.section-body{padding:1rem}",
+        ".metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:.8rem}.metric-card,.panel,.finding-card,.mini-card{background:rgba(31,41,55,.72);border:1px solid var(--border);border-radius:12px;padding:.85rem}.metric-label{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;margin-bottom:.25rem}.metric-value{font-weight:650;word-break:break-word}",
+        ".two-col{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:.8rem;margin-top:.8rem}.finding-grid,.mini-grid{display:grid;gap:.85rem}.finding-card h3,.mini-card h3,.panel h3{margin:.55rem 0}.finding-head{display:flex;justify-content:space-between;gap:.6rem;align-items:center;flex-wrap:wrap}",
+        ".severity-border-high{border-left:5px solid var(--high)}.severity-border-medium{border-left:5px solid var(--medium)}.severity-border-low{border-left:5px solid var(--low)}.severity-border-info{border-left:5px solid var(--muted)}",
+        ".badge{display:inline-block;border-radius:999px;padding:.15rem .5rem;font-size:.76rem;font-weight:700;border:1px solid rgba(255,255,255,.14);margin:.08rem .1rem .08rem 0;white-space:nowrap}.status-badge{display:inline-block;border-radius:999px;padding:.16rem .48rem;font-size:.72rem;font-weight:700;border:1px solid rgba(255,255,255,.12);white-space:nowrap;background:rgba(148,163,184,.12);color:#cbd5e1}.status-empty{color:var(--muted);background:rgba(148,163,184,.08)}.status-content{color:#bae6fd;background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.28)}.status-warning,.status-medium{color:#fde68a;background:rgba(245,158,11,.14);border-color:rgba(245,158,11,.35)}.status-high{color:#fecaca;background:rgba(239,68,68,.16);border-color:rgba(239,68,68,.42)}.status-low{color:#bfdbfe;background:rgba(59,130,246,.14);border-color:rgba(59,130,246,.34)}.status-info{color:#ddd6fe;background:rgba(139,92,246,.14);border-color:rgba(139,92,246,.34)}.muted{color:var(--muted)}",
+        ".severity-high,.priority-high{background:rgba(239,68,68,.18);color:#fecaca;border-color:rgba(239,68,68,.5)}.severity-medium,.priority-medium{background:rgba(245,158,11,.18);color:#fde68a;border-color:rgba(245,158,11,.5)}.severity-low,.priority-low{background:rgba(59,130,246,.18);color:#bfdbfe;border-color:rgba(59,130,246,.5)}.severity-info,.priority-info{color:var(--muted)}",
+        ".confidence-high{background:rgba(34,197,94,.16);color:#bbf7d0}.confidence-medium{background:rgba(245,158,11,.16);color:#fde68a}.confidence-low{background:rgba(156,163,175,.16);color:#e5e7eb}.flag-execute-write,.flag-resource-executable,.flag-text-writable,.flag-raw-outside-file{background:rgba(239,68,68,.18);color:#fecaca}.flag-high-entropy,.flag-suspicious-name,.flag-unusual-name,.flag-virtual-only,.flag-large-virtual-size{background:rgba(245,158,11,.18);color:#fde68a}",
+        ".table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;margin:.5rem 0 1rem}th,td{border-bottom:1px solid var(--border);padding:.55rem;text-align:left;vertical-align:top}th{color:#cbd5e1;background:rgba(2,6,23,.45)}table.kv th{width:230px;color:var(--muted)}.evidence-list,.steps,.mini-card ul{padding-left:1.25rem}.recommendation{color:#bbf7d0}.context-note{color:#fde68a}.wrap-list{line-height:1.85}.hidden-by-search{display:none!important}",
+        "@media(max-width:900px){.layout{grid-template-columns:1fr}.sidebar{position:static;height:auto}.main{padding:1rem}details.section>summary{align-items:flex-start;flex-direction:column}.summary-meta{justify-content:flex-start}}",
+    ])
+    js = "".join([
+        "const s=document.getElementById('globalSearch');",
+        "s?.addEventListener('input',()=>{const q=s.value.trim().toLowerCase();",
+        "document.querySelectorAll('.searchable,.searchable-table tbody tr').forEach(e=>{",
+        "if(!q){e.classList.remove('hidden-by-search');return}",
+        "e.classList.toggle('hidden-by-search',!e.innerText.toLowerCase().includes(q));});});",
+    ])
+
+    return (
+        '<!doctype html><html lang="en"><head>'
+        '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>{html_escape(title)}</title><style>{css}</style></head><body>'
+        '<div class="layout"><aside class="sidebar">'
+        '<h1>PE triage report</h1>'
+        f'<div class="subtitle">{html_escape(file_name)}<br>Generated UTC: {html_escape(generated_utc)}</div>'
+        '<nav>' + "".join(html_nav(title) for title in nav_titles) + '</nav>'
+        '</aside><main class="main"><section class="hero">'
+        f'<h2>{html_escape(title)}</h2>'
+        '<p>Static HTML report generated from the structured summary data. Malware strings are rendered as text/code, not as clickable links.</p>'
+        '</section><input id="globalSearch" class="search-box" type="search" placeholder="Filter visible findings, tables, imports, strings, and resources...">'
+        + "".join(sections) + f'<script>{js}</script></main></div></body></html>'
+    )
+
 ANSI_COLORS = {
     "reset": "\033[0m",
     "bold": "\033[1m",
@@ -4230,6 +5219,8 @@ def main():
     parser.add_argument("-o", "--output", metavar="PATH", help="text report path (default: <sample>_pe_summary.txt)")
     parser.add_argument("-j", "--json", action="store_true", help="also write detailed JSON report")
     parser.add_argument("--json-output", metavar="PATH", help="JSON report path (default: <sample>_pe_details.json)")
+    parser.add_argument("--no-html", action="store_true", help="do not write HTML report")
+    parser.add_argument("--html-output", metavar="PATH", help="HTML report path (default: <sample>_pe_report.html)")
     parser.add_argument("-p", "--print", dest="print_text", action="store_true", help="print text report to console")
     parser.add_argument("--no-color", action="store_true", help="disable colored console output")
     args = parser.parse_args()
@@ -4243,16 +5234,25 @@ def main():
         print("File not found", file=sys.stderr)
         sys.exit(1)
 
+    if args.json_output and not args.json:
+        args.json = True
+
     text_output_path = args.output or default_text_output_path(args.path)
     json_output_path = args.json_output or default_json_output_path(args.path)
+    html_output_path = args.html_output or default_html_output_path(args.path)
 
     text_content = format_text(summary)
+    html_content = format_html(summary, text_content=text_content)
 
     with open(text_output_path, "w", encoding="utf-8") as f:
         f.write(text_content)
 
-    if args.json_output and not args.json:
-        args.json = True
+    if not args.no_html:
+        html_content = format_html(summary, text_content=text_content)
+
+        with open(html_output_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+            print(f"Wrote HTML report to: {html_output_path}", file=sys.stderr)
 
     if args.json:
         json_content = json.dumps(summary, indent=2)
